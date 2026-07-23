@@ -4442,21 +4442,43 @@ DISAS_INSN(moves)
         return;
     }
 
-    if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
-        /* function codes with no address space cause a bus error */
-        gen_helper_moves_chk(tcg_env, addr,
-                             tcg_constant_i32((ext >> 11) & 1));
-    }
-    if (ext & 0x0800) {
-        /* from reg to ea */
-        gen_store(s, opsize, addr, reg, DFC_INDEX(s));
-    } else {
-        /* from ea to reg */
-        TCGv tmp = gen_load(s, opsize, addr, 0, SFC_INDEX(s));
-        if (extend) {
-            gen_ext(reg, tmp, opsize, 1);
+    if (m68k_feature(s->env, M68K_FEATURE_M68K) && s->env->fc_ops) {
+        /*
+         * The board decodes the function code lines itself (Sun-3
+         * style external MMU): put the whole access to its hooks so
+         * FC3 control space and the boot-state program space work.
+         */
+        TCGv size = tcg_constant_i32(opsize_bytes(opsize));
+
+        if (ext & 0x0800) {
+            gen_helper_moves_st(tcg_env, addr, size, reg);
         } else {
-            gen_partset_reg(opsize, reg, tmp);
+            TCGv tmp = tcg_temp_new();
+
+            gen_helper_moves_ld(tmp, tcg_env, addr, size);
+            if (extend) {
+                gen_ext(reg, tmp, opsize, 1);
+            } else {
+                gen_partset_reg(opsize, reg, tmp);
+            }
+        }
+    } else {
+        if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+            /* function codes with no address space cause a bus error */
+            gen_helper_moves_chk(tcg_env, addr,
+                                 tcg_constant_i32((ext >> 11) & 1));
+        }
+        if (ext & 0x0800) {
+            /* from reg to ea */
+            gen_store(s, opsize, addr, reg, DFC_INDEX(s));
+        } else {
+            /* from ea to reg */
+            TCGv tmp = gen_load(s, opsize, addr, 0, SFC_INDEX(s));
+            if (extend) {
+                gen_ext(reg, tmp, opsize, 1);
+            } else {
+                gen_partset_reg(opsize, reg, tmp);
+            }
         }
     }
     switch (extract32(insn, 3, 3)) {

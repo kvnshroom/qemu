@@ -162,7 +162,44 @@ typedef struct CPUArchState {
 
     /* Fields from here on are preserved across CPU reset. */
     uint64_t features;
+
+#if !defined(CONFIG_USER_ONLY)
+    /* Board function-code hooks (external Sun-3 style MMU), see below */
+    const struct M68kFCOps *fc_ops;
+    void *fc_ops_opaque;
+#endif
 } CPUM68KState;
+
+#if !defined(CONFIG_USER_ONLY)
+/*
+ * Hooks for boards whose MMU sits outside the CPU and decodes the
+ * function code lines, like the Sun-3.  When registered, translate()
+ * replaces the built-in 030/040 MMU in the TLB fill path, and moves()
+ * carries every MOVES access (the Sun-3 PROM drives its control space
+ * through MOVES with SFC/DFC=3, and reads the EPROM through FC6 while
+ * the boot state is active, neither of which can be expressed with
+ * the plain user/supervisor TLB indexes).
+ */
+typedef struct M68kFCOps {
+    /*
+     * Translate a virtual address for a normal (FC1/2/5/6) access.
+     * Return true and fill *physical (byte-exact for @addr) and *prot
+     * on success; return false to deliver a 68020/030 format A/B bus
+     * error.
+     */
+    bool (*translate)(void *opaque, vaddr addr, MMUAccessType access_type,
+                      int mmu_idx, hwaddr *physical, int *prot);
+    /*
+     * Perform a MOVES access in function code space @fc.  @size is
+     * 1, 2 or 4; the value is passed/returned in *val.  Return false
+     * to deliver a bus error.
+     */
+    bool (*moves)(void *opaque, int fc, vaddr addr, unsigned size,
+                  uint64_t *val, bool is_store);
+} M68kFCOps;
+
+void m68k_set_fc_ops(M68kCPU *cpu, const M68kFCOps *ops, void *opaque);
+#endif
 
 /*
  * M68kCPU:

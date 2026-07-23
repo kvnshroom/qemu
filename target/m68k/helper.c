@@ -1121,6 +1121,12 @@ void m68k_set_irq_level(M68kCPU *cpu, int level, uint8_t vector)
     }
 }
 
+void m68k_set_fc_ops(M68kCPU *cpu, const M68kFCOps *ops, void *opaque)
+{
+    cpu->env.fc_ops = ops;
+    cpu->env.fc_ops_opaque = opaque;
+}
+
 bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                        MMUAccessType qemu_access_type, int mmu_idx,
                        bool probe, uintptr_t retaddr)
@@ -1134,6 +1140,37 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     bool is_030 = m68k_feature(env, M68K_FEATURE_M68030);
     bool mmu_enabled = is_030 ? (env->mmu.tc030 & M68K_TC030_ENABLE)
                               : (env->mmu.tcr & M68K_TCR_ENABLED);
+
+    if (env->fc_ops) {
+        /*
+         * The board's external MMU decodes this access.  Its pages may
+         * be larger than TARGET_PAGE_SIZE (the Sun-3 uses 8KB); fill
+         * the TLB at TARGET_PAGE granularity, which the returned
+         * physical address matches byte-for-byte.
+         */
+        if (env->fc_ops->translate(env->fc_ops_opaque, address,
+                                   qemu_access_type, mmu_idx,
+                                   &physical, &prot)) {
+            tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                         physical & TARGET_PAGE_MASK,
+                         prot, mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
+        if (probe) {
+            return false;
+        }
+        /* board MMU fault: 68020/030 style data/instruction bus error */
+        env->mmu.ssw = 0;
+        if (qemu_access_type != MMU_INST_FETCH) {
+            env->mmu.ssw |= M68K_SSW_DF_030;
+        }
+        if (qemu_access_type != MMU_DATA_STORE) {
+            env->mmu.ssw |= M68K_SSW_RW_030;
+        }
+        cs->exception_index = EXCP_ACCESS;
+        env->mmu.ar = address;
+        cpu_loop_exit_restore(cs, retaddr);
+    }
 
     if (!mmu_enabled) {
         /* MMU disabled */

@@ -1241,6 +1241,18 @@ void HELPER(cmp2)(CPUM68KState *env, int32_t val, int32_t lb, int32_t ub)
  * address memory; nothing decodes the reserved codes or CPU space on
  * real boards, so such accesses end in a bus error.
  */
+static void moves_bus_error(CPUM68KState *env, uint32_t addr,
+                            uint32_t is_store, uintptr_t ra)
+{
+    env->mmu.mmusr = 0;
+    env->mmu.ssw = M68K_SSW_DF_030;
+    if (!is_store) {
+        env->mmu.ssw |= M68K_SSW_RW_030;
+    }
+    env->mmu.ar = addr;
+    raise_exception_ra(env, EXCP_ACCESS, ra);
+}
+
 void HELPER(moves_chk)(CPUM68KState *env, uint32_t addr, uint32_t is_store)
 {
     uint32_t fc = (is_store ? env->dfc : env->sfc) & 7;
@@ -1252,11 +1264,44 @@ void HELPER(moves_chk)(CPUM68KState *env, uint32_t addr, uint32_t is_store)
         env->bus_error_suppress = 0;
         return;
     }
-    env->mmu.mmusr = 0;
-    env->mmu.ssw = M68K_SSW_DF_030;
-    if (!is_store) {
-        env->mmu.ssw |= M68K_SSW_RW_030;
-    }
-    env->mmu.ar = addr;
-    raise_exception_ra(env, EXCP_ACCESS, GETPC());
+    moves_bus_error(env, addr, is_store, GETPC());
 }
+
+#if !defined(CONFIG_USER_ONLY)
+/*
+ * MOVES on boards with an external function-code-decoding MMU (Sun-3):
+ * every function code is put to the board, which reaches the control
+ * space (FC3) and honours the boot-state program-space mapping (FC6).
+ */
+uint32_t HELPER(moves_ld)(CPUM68KState *env, uint32_t addr, uint32_t size)
+{
+    uint64_t val;
+
+    if (env->fc_ops->moves(env->fc_ops_opaque, env->sfc & 7, addr, size,
+                           &val, false)) {
+        return val;
+    }
+    if (env->bus_error_suppress) {
+        env->bus_error_suppress = 0;
+        return 0;
+    }
+    moves_bus_error(env, addr, false, GETPC());
+    return 0;
+}
+
+void HELPER(moves_st)(CPUM68KState *env, uint32_t addr, uint32_t size,
+                      uint32_t val)
+{
+    uint64_t val64 = val;
+
+    if (env->fc_ops->moves(env->fc_ops_opaque, env->dfc & 7, addr, size,
+                           &val64, true)) {
+        return;
+    }
+    if (env->bus_error_suppress) {
+        env->bus_error_suppress = 0;
+        return;
+    }
+    moves_bus_error(env, addr, true, GETPC());
+}
+#endif /* !CONFIG_USER_ONLY */
