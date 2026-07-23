@@ -44,6 +44,9 @@ typedef struct ESCCChannelState {
     ESCCChnID chn; /* this channel, A (base+4) or B (base+0) */
     ESCCChnType type;
     uint8_t rx, tx;
+    /* external/status interrupt state (DCD input via the "dcd" gpios) */
+    uint32_t extint;
+    bool dcd;
     QemuInputHandlerState *hs;
     char *sunkbd_layout;
     int sunmouse_dx;

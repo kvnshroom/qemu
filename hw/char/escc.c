@@ -84,6 +84,7 @@
 #define CMD_PTR_MASK   0x07
 #define CMD_CMD_MASK   0x38
 #define CMD_HI         0x08
+#define CMD_RST_EXT    0x10
 #define CMD_CLR_TXINT  0x28
 #define CMD_CLR_IUS    0x38
 #define W_INTR    1
@@ -168,10 +169,14 @@
 #define IVEC_LORXINTA  0x0c
 #define IVEC_LORXINTB  0x04
 #define IVEC_LOTXINTA  0x08
+#define IVEC_LOEXTINTA 0x0a
+#define IVEC_LOEXTINTB 0x02
 #define IVEC_HINOINT   0x60
 #define IVEC_HIRXINTA  0x30
 #define IVEC_HIRXINTB  0x20
 #define IVEC_HITXINTA  0x10
+#define IVEC_HIEXTINTA 0x50
+#define IVEC_HIEXTINTB 0x40
 #define R_INTR    3
 #define INTR_EXTINTB   0x01
 #define INTR_TXINTB    0x02
@@ -263,7 +268,9 @@ static int escc_update_irq_chn(ESCCChannelState *s)
             s->rxint == 1) ||
         /* rx ints enabled, pending */
         ((s->wregs[W_EXTINT] & EXTINT_BRKINT) &&
-            (s->rregs[R_STATUS] & STATUS_BRK)))) {
+            (s->rregs[R_STATUS] & STATUS_BRK)) ||
+        /* external/status int (DCD change) enabled, pending */
+        ((s->wregs[W_INTR] & INTR_INTALL) && s->extint))) {
         /* break int e&p */
         return 1;
     }
@@ -286,6 +293,7 @@ static void escc_reset_chn(ESCCChannelState *s)
     s->reg = 0;
     s->rx = s->tx = 0;
     s->rxint = s->txint = 0;
+    s->extint = 0;
     s->rxint_under_svc = s->txint_under_svc = 0;
     s->e0_mode = s->led_mode = s->caps_lock_mode = s->num_lock_mode = 0;
     s->sunmouse_dx = s->sunmouse_dy = s->sunmouse_buttons = 0;
@@ -316,6 +324,10 @@ static void escc_soft_reset_chn(ESCCChannelState *s)
     s->rregs[R_STATUS] |= STATUS_TXEMPTY | STATUS_TXUNDRN;
     if (s->disabled) {
         s->rregs[R_STATUS] |= STATUS_DCD | STATUS_SYNC | STATUS_CTS;
+    }
+    /* a board-driven DCD line (the "dcd" gpio) survives reset */
+    if (s->dcd) {
+        s->rregs[R_STATUS] |= STATUS_DCD;
     }
     s->rregs[R_SPEC] &= SPEC_ALLSENT;
     s->rregs[R_SPEC] |= SPEC_BITS8;
@@ -422,6 +434,53 @@ static inline void set_txint(ESCCChannelState *s)
         }
         escc_update_irq(s);
     }
+}
+
+/*
+ * External/status interrupt (from a DCD transition): latched until a
+ * Reset External/Status Interrupts command.  Sets the modified vector
+ * so a Macintosh-style RR2B dispatch finds the right handler.
+ */
+static inline void set_extint(ESCCChannelState *s)
+{
+    s->extint = 1;
+    if (s->chn == escc_chn_a) {
+        s->rregs[R_INTR] |= INTR_EXTINTA;
+        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
+            s->otherchn->rregs[R_IVEC] = IVEC_HIEXTINTA;
+        } else {
+            s->otherchn->rregs[R_IVEC] = IVEC_LOEXTINTA;
+        }
+    } else {
+        s->otherchn->rregs[R_INTR] |= INTR_EXTINTB;
+        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
+            s->rregs[R_IVEC] = IVEC_HIEXTINTB;
+        } else {
+            s->rregs[R_IVEC] = IVEC_LOEXTINTB;
+        }
+    }
+    escc_update_irq(s);
+}
+
+static inline void clr_extint(ESCCChannelState *s)
+{
+    s->extint = 0;
+    if (s->chn == escc_chn_a) {
+        s->rregs[R_INTR] &= ~INTR_EXTINTA;
+        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
+            s->otherchn->rregs[R_IVEC] = IVEC_HINOINT;
+        } else {
+            s->otherchn->rregs[R_IVEC] = IVEC_LONOINT;
+        }
+    } else {
+        s->otherchn->rregs[R_INTR] &= ~INTR_EXTINTB;
+        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
+            s->rregs[R_IVEC] = IVEC_HINOINT;
+        } else {
+            s->rregs[R_IVEC] = IVEC_LONOINT;
+        }
+    }
+    escc_update_irq(s);
 }
 
 static inline void clr_rxint(ESCCChannelState *s)
@@ -559,6 +618,9 @@ static void escc_mem_write(void *opaque, hwaddr addr,
             switch (val) {
             case CMD_HI:
                 newreg |= CMD_HI;
+                break;
+            case CMD_RST_EXT:
+                clr_extint(s);
                 break;
             case CMD_CLR_TXINT:
                 clr_txint(s);
@@ -1038,6 +1100,30 @@ static const QemuInputHandler sunmouse_handler = {
     .sync  = sunmouse_sync,
 };
 
+/*
+ * DCD inputs, e.g. the Macintosh mouse quadrature lines.  Latches an
+ * external/status interrupt on any transition when enabled.
+ */
+static void escc_set_dcd(void *opaque, int n, int level)
+{
+    ESCCState *serial = opaque;
+    ESCCChannelState *s = &serial->chn[n];
+
+    if (s->dcd == !!level) {
+        return;
+    }
+    s->dcd = !!level;
+    if (level) {
+        s->rregs[R_STATUS] |= STATUS_DCD;
+    } else {
+        s->rregs[R_STATUS] &= ~STATUS_DCD;
+    }
+    if ((s->wregs[W_INTR] & INTR_INTALL) &&
+        (s->wregs[W_EXTINT] & EXTINT_DCD)) {
+        set_extint(s);
+    }
+}
+
 static void escc_init1(Object *obj)
 {
     ESCCState *s = ESCC(obj);
@@ -1052,6 +1138,9 @@ static void escc_init1(Object *obj)
     s->chn[1].otherchn = &s->chn[0];
 
     sysbus_init_mmio(dev, &s->mmio);
+
+    /* channel DCD inputs, indexed like chn[]: 0 = B, 1 = A */
+    qdev_init_gpio_in_named(DEVICE(obj), escc_set_dcd, "dcd", 2);
 }
 
 static void escc_realize(DeviceState *dev, Error **errp)
