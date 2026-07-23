@@ -156,6 +156,13 @@ typedef struct CPUArchState {
 
     int pending_vector;
     int pending_level;
+    /*
+     * A 1->7 transition of the IPL lines is a non-maskable edge: real
+     * 68k parts take a level 7 interrupt even at interrupt mask 7 as
+     * long as the lines *changed* to 7.  Latched here on the rising
+     * transition, consumed when the level 7 exception is taken.
+     */
+    uint32_t nmi_edge_pending;
 
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;

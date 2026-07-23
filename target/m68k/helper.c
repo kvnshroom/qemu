@@ -1112,6 +1112,9 @@ void m68k_set_irq_level(M68kCPU *cpu, int level, uint8_t vector)
     CPUState *cs = CPU(cpu);
     CPUM68KState *env = &cpu->env;
 
+    if (level == 7 && env->pending_level != 7) {
+        env->nmi_edge_pending = 1;
+    }
     env->pending_level = level;
     env->pending_vector = vector;
     if (level) {
