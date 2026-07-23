@@ -12,6 +12,10 @@ config NCR710_SCSI
     default y if LASI
     select SCSI
 
+config NCR5380
+    bool
+    select SCSI
+
 config MPTSAS_SCSI_PCI
     bool
     default y if PCI_DEVICES
