@@ -5367,6 +5367,12 @@ DISAS_INSN(frestore)
     if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
         SRC_EA(env, addr, OS_LONG, 0, NULL);
         /* FIXME: check the state frame */
+    } else if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+        /*
+         * 68881/68882: we always save a NULL frame, so accept anything
+         * here and reset the FPU to its null (reset) state.
+         */
+        SRC_EA(env, addr, OS_LONG, 0, NULL);
     } else {
         disas_undef(env, s, insn);
     }
@@ -5383,6 +5389,13 @@ DISAS_INSN(fsave)
         /* always write IDLE */
         TCGv idle = tcg_constant_i32(0x41000000);
         DEST_EA(env, insn, OS_LONG, idle, NULL);
+    } else if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+        /*
+         * 68881/68882: always write a NULL frame (version byte 0),
+         * meaning the coprocessor has no internal state to restore.
+         */
+        TCGv null = tcg_constant_i32(0x00000000);
+        DEST_EA(env, insn, OS_LONG, null, NULL);
     } else {
         disas_undef(env, s, insn);
     }
