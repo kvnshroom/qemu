@@ -6210,5 +6210,6 @@ void m68k_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->mmu.ttr[M68K_ITTR0], env->mmu.ttr[M68K_ITTR1]);
     qemu_fprintf(f, "MMUSR %08x, fault at %08x\n",
                  env->mmu.mmusr, env->mmu.ar);
+    qemu_fprintf(f, "CAAR %08x\n", env->caar);
 #endif /* !CONFIG_USER_ONLY */
 }
