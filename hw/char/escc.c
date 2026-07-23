@@ -320,6 +320,7 @@ static void escc_soft_reset_chn(ESCCChannelState *s)
     /* Enable most interrupts */
     s->wregs[W_EXTINT] = EXTINT_DCD | EXTINT_SYNCINT | EXTINT_CTSINT |
                          EXTINT_TXUNDRN | EXTINT_BRKINT;
+    s->rregs[R_EXTINT] = s->wregs[W_EXTINT];
 
     s->rregs[R_STATUS] &= STATUS_DCD | STATUS_SYNC | STATUS_CTS | STATUS_BRK;
     s->rregs[R_STATUS] |= STATUS_TXEMPTY | STATUS_TXUNDRN;
@@ -667,8 +668,20 @@ static void escc_mem_write(void *opaque, hwaddr addr,
         case W_INTR ... W_IVEC:
         case W_SYNC1 ... W_TXBUF:
         case W_MISC1 ... W_CLOCK:
-        case W_MISC2 ... W_EXTINT:
+        case W_MISC2:
             s->wregs[s->reg] = val;
+            break;
+        case W_EXTINT:
+            s->wregs[s->reg] = val;
+            /*
+             * RR15 reads back WR15 (bits 0 and 2 exist only as WR7'
+             * enables and always read 0).  The Macintosh ROM's SCC
+             * interrupt handler reads RR15 as its DCD-changed mask, so
+             * a zero here silently drops mouse quadrature interrupts.
+             */
+            s->rregs[R_EXTINT] = val & (EXTINT_DCD | EXTINT_SYNCINT |
+                                        EXTINT_CTSINT | EXTINT_TXUNDRN |
+                                        EXTINT_BRKINT | 0x02);
             break;
         case W_TXCTRL1:
             s->wregs[s->reg] = val;
