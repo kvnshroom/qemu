@@ -29,6 +29,7 @@
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 #include "hw/char/escc.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "ui/console.h"
@@ -437,28 +438,54 @@ static inline void set_txint(ESCCChannelState *s)
 }
 
 /*
- * External/status interrupt (from a DCD transition): latched until a
- * Reset External/Status Interrupts command.  Sets the modified vector
- * so a Macintosh-style RR2B dispatch finds the right handler.
+ * External/status interrupts (from DCD transitions): latched until a
+ * Reset External/Status Interrupts command.  The modified vector (as
+ * read from RR2 on channel B, which a Macintosh-style ISR dispatches
+ * on) is recomputed from the set of still-pending ext ints, channel A
+ * first, so that clearing one channel's interrupt while the other is
+ * pending re-points the vector instead of losing the second edge in a
+ * stale "no interrupt" dispatch.
  */
+static inline void refresh_ext_ivec(ESCCChannelState *s)
+{
+    ESCCChannelState *a = (s->chn == escc_chn_a) ? s : s->otherchn;
+    ESCCChannelState *b = a->otherchn;
+    uint8_t vec;
+
+    /*
+     * Enabled rx/tx interrupt vectors take precedence, leave theirs
+     * alone.  Note that txint is latched by every data write even
+     * with tx interrupts disabled, so it must not block ext vector
+     * updates on its own.
+     */
+    if ((a->rxint && (a->wregs[W_INTR] & INTR_RXMODEMSK)) ||
+        (b->rxint && (b->wregs[W_INTR] & INTR_RXMODEMSK)) ||
+        (a->txint && (a->wregs[W_INTR] & INTR_TXINT)) ||
+        (b->txint && (b->wregs[W_INTR] & INTR_TXINT))) {
+        return;
+    }
+    if (a->extint) {
+        vec = (a->wregs[W_MINTR] & MINTR_STATUSHI) ? IVEC_HIEXTINTA
+                                                   : IVEC_LOEXTINTA;
+    } else if (b->extint) {
+        vec = (b->wregs[W_MINTR] & MINTR_STATUSHI) ? IVEC_HIEXTINTB
+                                                   : IVEC_LOEXTINTB;
+    } else {
+        vec = (a->wregs[W_MINTR] & MINTR_STATUSHI) ? IVEC_HINOINT
+                                                   : IVEC_LONOINT;
+    }
+    b->rregs[R_IVEC] = vec;
+}
+
 static inline void set_extint(ESCCChannelState *s)
 {
     s->extint = 1;
     if (s->chn == escc_chn_a) {
         s->rregs[R_INTR] |= INTR_EXTINTA;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->otherchn->rregs[R_IVEC] = IVEC_HIEXTINTA;
-        } else {
-            s->otherchn->rregs[R_IVEC] = IVEC_LOEXTINTA;
-        }
     } else {
         s->otherchn->rregs[R_INTR] |= INTR_EXTINTB;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->rregs[R_IVEC] = IVEC_HIEXTINTB;
-        } else {
-            s->rregs[R_IVEC] = IVEC_LOEXTINTB;
-        }
     }
+    refresh_ext_ivec(s);
     escc_update_irq(s);
 }
 
@@ -467,19 +494,10 @@ static inline void clr_extint(ESCCChannelState *s)
     s->extint = 0;
     if (s->chn == escc_chn_a) {
         s->rregs[R_INTR] &= ~INTR_EXTINTA;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->otherchn->rregs[R_IVEC] = IVEC_HINOINT;
-        } else {
-            s->otherchn->rregs[R_IVEC] = IVEC_LONOINT;
-        }
     } else {
         s->otherchn->rregs[R_INTR] &= ~INTR_EXTINTB;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->rregs[R_IVEC] = IVEC_HINOINT;
-        } else {
-            s->rregs[R_IVEC] = IVEC_LONOINT;
-        }
     }
+    refresh_ext_ivec(s);
     escc_update_irq(s);
 }
 
