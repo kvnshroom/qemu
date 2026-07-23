@@ -1083,6 +1083,17 @@ hwaddr m68k_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
     int access_type;
     target_ulong page_size;
 
+    if (env->fc_ops) {
+        /* board MMU (Sun-3): debug accesses use supervisor data space */
+        int prot_fc;
+
+        if (env->fc_ops->translate(env->fc_ops_opaque, addr, MMU_DATA_LOAD,
+                                   MMU_KERNEL_IDX, &phys_addr, &prot_fc)) {
+            return phys_addr;
+        }
+        return -1;
+    }
+
     if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
         /* MMU disabled */
         return addr;
@@ -1163,13 +1174,19 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             return false;
         }
         /* board MMU fault: 68020/030 style data/instruction bus error */
+        int fc = mmu_idx == MMU_KERNEL_IDX ? 4 : 0;
+
         env->mmu.ssw = 0;
         if (qemu_access_type != MMU_INST_FETCH) {
             env->mmu.ssw |= M68K_SSW_DF_030;
+            fc |= 1;            /* data space */
+        } else {
+            fc |= 2;            /* program space */
         }
         if (qemu_access_type != MMU_DATA_STORE) {
             env->mmu.ssw |= M68K_SSW_RW_030;
         }
+        env->mmu.ssw |= M68K_SSW_FC_030(fc);
         cs->exception_index = EXCP_ACCESS;
         env->mmu.ar = address;
         cpu_loop_exit_restore(cs, retaddr);
