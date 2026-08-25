@@ -617,6 +617,27 @@ uint8_t ncr5380_pdma_read(NCR5380State *s)
              * poll must already see the change.
              */
             ncr5380_enter_status(s);
+        } else {
+            /*
+             * Model the per-byte SCSI /REQ handshake: the target
+             * deasserts /REQ once the initiator's pseudo-DMA read
+             * (DACK) has taken this byte, and reasserts it for the
+             * next one.  A blind reader that drains the whole transfer
+             * in a single loop only ever samples /REQ *after* the last
+             * byte (by which point enter_status above has moved the bus
+             * to STATUS), so this is invisible to it -- e.g. the IIci/
+             * IIsi ROMs are unaffected.  But a *chunked* reader hangs
+             * without it: the Mac II / SE30 ROM SCSI Manager drains a
+             * multi-sector transfer 512 bytes at a time and, between
+             * chunks, spins on CSB bit 5 waiting for /REQ to drop
+             * before fetching the next chunk (observed live: a
+             * 192-sector READ(10) that stalled after exactly one 512-
+             * byte chunk).  The chunk's byte-move loop gates on DRQ,
+             * which stays asserted until the buffer fully drains, so
+             * clearing /REQ here does not disturb the copy loop; it
+             * only lets the inter-chunk /REQ poll make progress.
+             */
+            s->csb &= ~CSB_REQ;
         }
     } else {
         trace_ncr5380_stale_read(s->buf_pos, s->buf_len);
