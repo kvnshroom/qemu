@@ -1258,8 +1258,21 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
      * Mac IIsi System boot then wrote its MMU-table wipe 16 bytes
      * high, which crossed a 4K boundary at offset 0xFFC and corrupted
      * the live level-A table.
+     *
+     * Further, per MC68030 UM 9.1.2 "Page Address" (and MC68851 UM
+     * 5.1.5.3.15, identical wording): when the page size is larger
+     * than 256 bytes, the low-order (PS-8) bits of this field are
+     * "not used" by the hardware at all -- they are reserved for
+     * software (SunOS keeps a tag there on every kernelmap/obio
+     * descriptor; the real 3/80 PROM does the same).  The true
+     * in-page bits of the physical address always come from the
+     * *logical* address, never from the descriptor.  So the frame
+     * must be masked down to the page-size (PS) boundary, not just to
+     * the status byte, before it is combined with the logical offset
+     * below.  (PS is a TC-register-wide constant, independent of how
+     * many table levels this particular walk consumed.)
      */
-    table &= 0xffffff00;
+    table &= ~((1u << MAX(M68K_TC030_PS(tc), 8)) - 1);
     if (ptest && wp) {
         env->mmu.mmusr |= M68K_MMU030_PSR_W;
     }
