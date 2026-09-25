@@ -665,7 +665,43 @@ static void escc_mem_write(void *opaque, hwaddr addr,
                 s->rregs[R_STATUS] |= STATUS_SYNC;
             }
             break;
-        case W_INTR ... W_IVEC:
+        case W_INTR:
+            s->wregs[s->reg] = val;
+            /*
+             * RR3's per-channel Tx-pending bit is normally latched by
+             * set_txint() at the moment a Tx-empty condition occurs, gated
+             * by whatever WR1 (this register) says *at that instant*. But
+             * on a real Z8530, enabling Tx interrupts (WR1) while the
+             * transmitter is already idle makes the chip assert /INT
+             * immediately -- e.g. a driver opening a channel with nothing
+             * queued to send. If WR1 is (re)written after txint was
+             * already latched with Tx interrupts still masked, the cached
+             * RR3 bit never got set and is left permanently out of sync
+             * with the live, correctly-masked interrupt condition that
+             * escc_update_irq_chn() computes -- so a poll/interrogate
+             * routine reading RR3 to find the interrupt source (as real
+             * zs drivers do) can conclude nothing is pending on this
+             * channel while the hardware line is still asserted,
+             * producing an unrecognised, un-acknowledged, permanently
+             * re-triggering interrupt. Resync the bit here so RR3 always
+             * matches the current mask instead of a stale snapshot.
+             */
+            if (s->chn == escc_chn_a) {
+                if (s->txint && (val & INTR_TXINT)) {
+                    s->rregs[R_INTR] |= INTR_TXINTA;
+                } else {
+                    s->rregs[R_INTR] &= ~INTR_TXINTA;
+                }
+            } else {
+                if (s->txint && (val & INTR_TXINT)) {
+                    s->otherchn->rregs[R_INTR] |= INTR_TXINTB;
+                } else {
+                    s->otherchn->rregs[R_INTR] &= ~INTR_TXINTB;
+                }
+            }
+            escc_update_irq(s);
+            break;
+        case W_IVEC:
         case W_SYNC1 ... W_TXBUF:
         case W_MISC1 ... W_CLOCK:
         case W_MISC2:
