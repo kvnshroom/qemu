@@ -115,8 +115,20 @@ static void lance_realize(DeviceState *dev, Error **errp)
 
     sysbus_init_irq(sbd, &s->irq);
 
+    /*
+     * sparc32's ledma is the only in-tree DMA-opaque implementation, and it
+     * lives in hw/dma/sparc32_dma.c (CONFIG_STP2000, sun4m-only): other
+     * targets/boards that want a plain LANCE (e.g. m68k's sun3x "le", wired
+     * through its own IOMMU) are not guaranteed to link that file in, so
+     * only default to it when it is actually available and leave the
+     * pointers NULL otherwise -- the board is expected to install its own
+     * phys_mem_read/phys_mem_write right after realizing the device, same
+     * as sun4m effectively does by depending on this default.
+     */
+#ifdef CONFIG_STP2000
     s->phys_mem_read = ledma_memory_read;
     s->phys_mem_write = ledma_memory_write;
+#endif
     pcnet_common_init(dev, s, &net_lance_info);
 }
 
