@@ -1,0 +1,4 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# sun3x.c
+sun3x_parity_error(uint64_t addr, uint8_t status) "bad-parity read at 0x%08" PRIx64 " -> bus error, memreg status 0x%02x"
