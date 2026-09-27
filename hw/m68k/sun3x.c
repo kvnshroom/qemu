@@ -191,6 +191,37 @@
 /* Z8530 (ESCC) PCLK, it_shift==1: channel = (addr >> 2) & 1, reg = (addr >> 1) & 1 */
 #define SUN3X_ZS_FREQ           4915200
 
+/*
+ * "bwtwo" on-board monochrome frame buffer, modelled as a genuine Sun
+ * P4-bus device -- see hw/display/sun-bwtwo.c's file header for the
+ * kernel/PROM evidence.
+ *   - SUN3X_VIDEO_P4ID (0x50300000) is the literal address autoconfig
+ *     prints ("bwtwo0 at obmem 0x50300000") and the P4 register
+ *     bwtwoprobe()/p4probe() peek/write-probe: top byte read-only
+ *     (ID | resolution, 0x01 for this fixed 1152x900 onboard board), low
+ *     byte read/write control bits (VIDEO/VTRACE/etc).  Matches Linux's
+ *     own arch/m68k/include/asm/sun3x.h SUN3X_VIDEO_P4ID.
+ *   - The real 128 KiB VRAM is aliased at two places sun-bwtwo.c's
+ *     realize() maps relative to this same base: SUN3X_VIDEO_P4ID+0x2000
+ *     (the kernel's bwtwoprobe()/bwtwommap() convention) and
+ *     SUN3X_VIDEO_P4ID+0x100000, mirrored across 256 KiB (the PROM's own
+ *     "VIDEOMEM_BASE" convention) -- both phase-0-aligned onto the same
+ *     backing store, so pixel (0,0) is byte 0 in both windows.
+ */
+#define SUN3X_VIDEO_P4ID        0x50300000
+
+/*
+ * "sunos-console" machine property (SunOS/real-PROM mode only): selects the
+ * NVRAM console byte the genuine boot PROM/kernel consult (see
+ * sun3x_build_nvram() below and hw/m68k/sun3x-NOTES.md).  false (default) =
+ * "ttya", matching every existing regression baseline; true = "fb" (local
+ * bwtwo screen + Sun keyboard/mouse).  A single QEMU process only ever
+ * instantiates one sun3x machine, so a file-scope global set by the property
+ * setter before sun3x_init()/sun3x_build_nvram() run is sufficient -- there
+ * is no separate QOM machine-state subclass to hang this off of.
+ */
+static bool sun3x_console_fb;
+
 typedef struct Sun3xState {
     M68kCPU *cpu;
     DeviceState *irqc;
@@ -1688,11 +1719,16 @@ static void sun3x_build_nvram(Sun3xState *s)
 
     /*
      * EEPROM configuration bytes (SunOS mode).  Byte 0x1f selects the console
-     * device; force ttya so the genuine monitor talks to the zs serial port
-     * and does not wait on an (absent) on-board framebuffer + keyboard.
+     * device (NetBSD sys/arch/sun3/include/eeprom.h EE_CONS_* encoding):
+     * EE_CONS_BW 0x00 (on-board bwtwo + Sun kbd/mouse, "local"), EE_CONS_TTYA
+     * 0x10 (the default: serial, so automation works unattended),
+     * EE_CONS_TTYB 0x11,
+     * EE_CONS_COLOR 0x12.  Selected by the "sunos-console" machine property
+     * (see sun3x_machine_init()); ttya unless a caller opts into "fb".
      */
     if (s->sunos) {
-        p[0x1f] = 0x10;         /* EE_CONS_TTYA */
+        p[0x1f] = sun3x_console_fb ? 0x00 /* EE_CONS_BW */
+                                    : 0x10 /* EE_CONS_TTYA */;
     }
 
     /* idprom */
@@ -2023,27 +2059,92 @@ static void sun3x_init(MachineState *machine)
     qemu_irq_raise(qdev_get_gpio_in_named(dev, "dcd", 0));
     qemu_irq_raise(qdev_get_gpio_in_named(dev, "dcd", 1));
 
-    /* the other Z8530 (keyboard/mouse in SunOS mode), left idle */
+    /*
+     * The other Z8530: keyboard (channel A) + mouse (channel B) in SunOS
+     * mode, exactly like sparc/sun4m's own on-board ms/kb chip (hw/sparc/
+     * sun4m.c) -- reuse the same escc_kbd/escc_mouse channel types and the
+     * same PCLK (SUN3X_ZS_FREQ == sun4m's ESCC_CLOCK, 4915200 Hz; the Sun
+     * keyboard/mouse protocols are generated internally by these channel
+     * types, not bit-banged over a literal 1200-baud UART timer, so no
+     * separate baud-rate wiring is needed).  No chardev backend -- like
+     * sun4m, these channels register QEMU input handlers directly.
+     *
+     * Disabled whenever there is no display (matches sun4m's own
+     * `!machine->enable_graphics` gating): with -nographic/-display none
+     * (every existing serial-only Linux/NetBSD/SunOS-console regression
+     * script), this chip stays idle and those workflows are unchanged.
+     */
     dev = qdev_new(TYPE_ESCC);
-    qdev_prop_set_uint32(dev, "disabled", 0);
+    qdev_prop_set_uint32(dev, "disabled", !machine->enable_graphics);
     qdev_prop_set_uint32(dev, "frequency", SUN3X_ZS_FREQ);
     qdev_prop_set_uint32(dev, "it_shift", 1);
     qdev_prop_set_chr(dev, "chrA", NULL);
     qdev_prop_set_chr(dev, "chrB", NULL);
-    qdev_prop_set_uint32(dev, "chnAtype", escc_serial);
-    qdev_prop_set_uint32(dev, "chnBtype", escc_serial);
+    qdev_prop_set_uint32(dev, "chnAtype", escc_kbd);
+    qdev_prop_set_uint32(dev, "chnBtype", escc_mouse);
+    /*
+     * escc.c's generic sunkbd_layout_dip_switch() defaults to a Type-5
+     * dip-switch encoding (0x21 == "en-us", from Table 3-16's Type-4/5/5c
+     * column for *Type 5* keyboards -- see the "US5.kt" comment there) even
+     * though the LAYOUT reply always follows a hardcoded "Type 4" reset ID
+     * (put_queue(s, 4)); on real Type-4-only clients that combination is
+     * simply invalid.  This machine's era (SunOS 4.1.1 / OpenWindows 2.0)
+     * is exactly such a client: OpenWindows 2.0's own NeWS keyboard tables
+     * (verified against the installed sun3x disk image's own
+     * /usr/openwin/share/etc/NeWS/keyboard.ps, reached via the etc ->
+     * share/etc symlink) define only Type-4-generation entries
+     * (KB_SUN4_US = 4, i.e. base type 4 + a *Type-4* layout byte of 0x00
+     * for US, KB_SUN4_JAPAN = 36 = 4 + 0x20, etc.) -- no Type-5 case
+     * exists at all.  Feeding the generic default's Type-5 byte (0x21)
+     * makes NeWS's keybdinit.ps "KeyboardType case" fall through to
+     * /Default (false), never defining its ascii000/etc. keymap
+     * dictionaries, which is the exact, live-reproduced
+     * "ClassKeyboard couldn't initialize the keyboard" / "ascii000 ...
+     * undefined" failure (see hw/m68k/sun3x-NOTES.md).
+     * Override with the numeric-dip-switch form the property already
+     * supports ("0" == US, Type-4 byte 0x00) so this machine reports a
+     * self-consistent (type=4, layout=0x00) pair; sun4m's own on-board
+     * kb/ms chip (hw/sparc/sun4m.c) is left at the unchanged default.
+     */
+    qdev_prop_set_string(dev, "chnA-sunkbd-layout", "0");
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, s->sunos ? SUN3X_ZS1 : SUN3X_ZS2);
     /*
-     * This chip is otherwise idle (no chardev backend) but its two IRQ
-     * outputs are real, wired hardware outputs on the shared level-6 line
-     * exactly like the console chip's -- left unconnected, the kernel could
-     * never see/ack anything from this chip's slot.  Wire them into the
-     * same OR gate.
+     * Both IRQ outputs are real, wired hardware outputs on the shared
+     * level-6 line exactly like the console chip's -- left unconnected,
+     * the kernel could never see/ack anything from this chip's slot.
+     * Wire them into the same OR gate (harmless even while `disabled`).
      */
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(s->zs_orgate, 2));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(s->zs_orgate, 3));
+
+    /*
+     * "bwtwo" on-board monochrome frame buffer (OBMEM, see hw/display/
+     * sun-bwtwo.c and the SUN3X_VIDEO_* defines above for the full
+     * hardware contract).  Mapped in both modes ("Linux mode too,
+     * harmless" -- the sun3x Linux port has no display driver, so it
+     * simply never touches this window); this is what lets the genuine
+     * PROM (-bios) probe a display and draw its self-test banner there,
+     * and what lets SunOS's bwtwoprobe() attach bwtwo0.  The EEPROM
+     * input-device/console selection (sun3x_build_nvram()) still points
+     * ttya at the console Z8530 above, so serial-only workflows are
+     * unaffected regardless of this device's presence.
+     */
+    {
+        DeviceState *bwtwo_dev = qdev_new("sun-bwtwo");
+        SysBusDevice *bwtwo_sbd = SYS_BUS_DEVICE(bwtwo_dev);
+
+        sysbus_realize_and_unref(bwtwo_sbd, &error_fatal);
+        /* mmio 0: the P4 register itself. 1: kernel's softc.addr window
+         * (P4ID+0x2000). 2,3: the PROM's VIDEOMEM_BASE window, mirrored
+         * across its full 256 KiB span (P4ID+0x100000, +0x120000) -- see
+         * hw/display/sun-bwtwo.c's file header. */
+        sysbus_mmio_map(bwtwo_sbd, 0, SUN3X_VIDEO_P4ID);
+        sysbus_mmio_map(bwtwo_sbd, 1, SUN3X_VIDEO_P4ID + 0x2000);
+        sysbus_mmio_map(bwtwo_sbd, 2, SUN3X_VIDEO_P4ID + 0x100000);
+        sysbus_mmio_map(bwtwo_sbd, 3, SUN3X_VIDEO_P4ID + 0x120000);
+    }
 
     if (!s->sunos) {
         /* synthesised boot PROM window (identity mapped) */
@@ -2341,6 +2442,25 @@ static void sun3x_init(MachineState *machine)
     qemu_register_reset(sun3x_cpu_reset, s);
 }
 
+static char *sun3x_get_sunos_console(Object *obj, Error **errp)
+{
+    return g_strdup(sun3x_console_fb ? "fb" : "ttya");
+}
+
+static void sun3x_set_sunos_console(Object *obj, const char *value,
+                                    Error **errp)
+{
+    if (!strcmp(value, "ttya")) {
+        sun3x_console_fb = false;
+    } else if (!strcmp(value, "fb")) {
+        sun3x_console_fb = true;
+    } else {
+        error_setg(errp,
+                  "Invalid sunos-console value '%s': must be 'ttya' or 'fb'",
+                  value);
+    }
+}
+
 static void sun3x_machine_init(MachineClass *mc)
 {
     mc->desc = "Sun 3/80 (68030)";
@@ -2352,6 +2472,14 @@ static void sun3x_machine_init(MachineClass *mc)
     mc->no_floppy = 1;
     mc->no_parallel = 1;
     mc->no_cdrom = 1;
+
+    object_class_property_add_str(OBJECT_CLASS(mc), "sunos-console",
+                                  sun3x_get_sunos_console,
+                                  sun3x_set_sunos_console);
+    object_class_property_set_description(OBJECT_CLASS(mc), "sunos-console",
+        "SunOS/real-PROM-mode console (NVRAM byte 0x1f): 'ttya' (default, "
+        "serial) or 'fb' (local bwtwo screen + Sun keyboard/mouse). Ignored "
+        "in Linux-shim mode (no -bios).");
 }
 
 DEFINE_MACHINE("sun3x", sun3x_machine_init)

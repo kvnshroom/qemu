@@ -66,3 +66,4 @@ config SUN3X
     select M68K_IRQC
     select NCR5380
     select OR_IRQ
+    select SUN_BWTWO
