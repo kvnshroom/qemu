@@ -50,6 +50,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/reset.h"
+#include "qemu/timer.h"
 #include "system/system.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
@@ -57,6 +58,8 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/char/escc.h"
 #include "hw/rtc/icm7170.h"
+#include "hw/scsi/ncr5380.h"
+#include "hw/scsi/scsi.h"
 #include "target/m68k/cpu.h"
 
 /* --- Sun-3 MMU geometry --- */
@@ -146,6 +149,71 @@
 #define SUN3_OBIO_MEMREG        0x001E0000
 
 /*
+ * "si" SCSI: NCR5380 + Am9516 UDC DMA + 16-bit FIFO at obio 0x140000.
+ * Register map from the 3/60 PROM's si driver and NetBSD's sireg.h /
+ * si_obio.c (see hw/m68k/sun3-NOTES.md, "si" section):
+ * the 5380's eight registers are byte-spaced at +0..+7, the rest are
+ * 16-bit.  Registers marked VME exist on the VME "si"/"sc" boards only;
+ * the PROM still writes them, so they are plain read/write scratch here.
+ */
+#define SUN3_SI_SIZE            0x28
+#define SI_DMA_ADDRH            0x08    /* VME */
+#define SI_DMA_ADDRL            0x0a    /* VME */
+#define SI_DMA_COUNTH           0x0c    /* VME */
+#define SI_DMA_COUNTL           0x0e    /* VME */
+#define SI_UDC_DATA             0x10    /* UDC register data */
+#define SI_UDC_ADDR             0x12    /* UDC register select */
+#define SI_FIFO_DATA            0x14    /* FIFO word latch (odd-byte pickup) */
+#define SI_FIFO_COUNT           0x16    /* byte counter, loaded by the driver */
+#define SI_CSR                  0x18
+#define SI_BPACK_HI             0x1a    /* VME */
+#define SI_BPACK_LO             0x1c    /* VME */
+#define SI_IVECT                0x1e    /* VME (PROM writes 0x3d00 at init) */
+#define SI_FIFO_CNT_HI          0x20    /* VME */
+
+#define SI_CSR_DMA_ACTIVE       0x8000  /* r/o */
+#define SI_CSR_DMA_CONFLICT     0x4000  /* r/o: register access during DMA */
+#define SI_CSR_DMA_BUS_ERR      0x2000  /* r/o: DVMA bus error */
+#define SI_CSR_ID               0x1000  /* r/o: 1 = SCSI-3 / Emulex (VME) */
+#define SI_CSR_FIFO_FULL        0x0800  /* r/o */
+#define SI_CSR_FIFO_EMPTY       0x0400  /* r/o */
+#define SI_CSR_SBC_IP           0x0200  /* r/o: 5380 interrupt pending */
+#define SI_CSR_DMA_IP           0x0100  /* r/o: DMA (UDC) interrupt pending */
+#define SI_CSR_DMA_EN           0x0010  /* r/w: DMA enable (VME) */
+#define SI_CSR_SEND             0x0008  /* r/w: DMA direction, 1 = to device */
+#define SI_CSR_INTR_EN          0x0004  /* r/w: interrupt enable */
+#define SI_CSR_FIFO_RES         0x0002  /* r/w: FIFO reset, active LOW */
+#define SI_CSR_SCSI_RES         0x0001  /* r/w: 5380 + UDC reset, active LOW */
+#define SI_CSR_RW_BITS          0x001f
+
+/* Am9516 UDC registers the drivers touch (through UDC_ADDR/UDC_DATA) */
+#define UDC_ADR_CAR_LOW         0x22    /* chain address, low word */
+#define UDC_ADR_CAR_HIGH        0x26    /* chain address, bits 23..16 in 15..8 */
+#define UDC_ADR_COMMAND         0x2e    /* master command register */
+#define UDC_ADR_COUNT           0x32    /* current operation count (words) */
+#define UDC_ADR_MODE            0x38    /* channel mode register */
+#define UDC_CMD_RESET           0x00
+#define UDC_CMD_CIE             0x32    /* channel interrupt enable */
+#define UDC_CMD_START_CHN       0xa0    /* start chain: load the table below */
+
+/* the six-word command table the UDC fetches from DVMA at start-chain */
+#define UDC_TBL_RSEL            0       /* 0x182 receive / 0x282 send */
+#define UDC_TBL_ADDRH           1       /* ((pa & 0xff0000) >> 8) | 0x40 */
+#define UDC_TBL_ADDRL           2       /* pa & 0xffff */
+#define UDC_TBL_COUNT           3       /* transfer length in words */
+#define UDC_TBL_CMRH            4       /* 0x40 */
+#define UDC_TBL_CMRL            5       /* 0xd2 receive / 0xc2 send */
+#define UDC_TBL_WORDS           6
+
+/*
+ * Sun-3 DVMA: on-board DMA masters present a 24-bit address that the
+ * MMU translates as virtual 0x0F000000 | addr in the *current* context
+ * (which is why the kernels map their DVMA segments in all contexts).
+ */
+#define SUN3_DVMA_BASE          0x0F000000
+#define SUN3_DVMA_MASK          0x00FFFFFF
+
+/*
  * 3/60 on-board devices in the high type-0 (obmem) space, from the
  * monitor's device map table at ROM offset 0xD350:
  * 0xFF000000 video RAM (the monitor also runs its early stack here),
@@ -225,7 +293,23 @@ struct Sun3MachineState {
     MemoryRegion intreg_mr;
     MemoryRegion memerr_mr;
     MemoryRegion memreg_mr;
+    MemoryRegion si_mr;
     qemu_irq *irqs;             /* per-source device inputs */
+
+    /* si SCSI */
+    NCR5380State si_sbc;
+    uint16_t si_csr;
+    uint16_t si_fifo_count;
+    uint16_t si_fifo_data;
+    uint16_t si_scratch[SUN3_SI_SIZE / 2];  /* VME-only registers */
+    bool si_sbc_irq;            /* 5380 IRQ output */
+    uint8_t udc_addr;           /* UDC register select */
+    uint16_t udc_car_hi, udc_car_lo, udc_mode;
+    uint32_t udc_dma_addr;      /* active channel: 24-bit DVMA address */
+    uint16_t udc_count;         /* active channel: words left */
+    bool udc_active;
+    bool udc_ip;                /* DMA interrupt pending */
+    QEMUTimer si_dma_timer;     /* the transfer runs after the start */
 
     uint32_t reset_sp;
     uint32_t reset_pc;
@@ -243,7 +327,17 @@ struct Sun3MachineState {
     /* interrupts */
     uint8_t intreg;
     uint16_t irq_sources;       /* asserted device lines, by source index */
-    bool clock_latch;           /* board latch fed by the ICM7170 INT pin */
+    /*
+     * The clock interrupt is latched on the board, once per enabled
+     * level: the OS acknowledges a tick by momentarily dropping that
+     * level's enable bit in the interrupt register.  The two latches are
+     * separate -- SunOS runs with both the level-5 and the level-7 clock
+     * enabled (intreg 0xA1) and acks the level-7 tick with 0xA1 -> 0x21
+     * -> 0xA1, which with a single shared latch re-presented the stale
+     * level 5 latch as a second, unexpected level-7 interrupt the moment
+     * the enable came back (the PROM then reports "Exception 0x7C").
+     */
+    bool clock_latch[8];        /* board latches fed by the ICM7170 INT pin */
 
     /* memory error (parity) registers */
     uint8_t memerr_csr;
@@ -276,10 +370,12 @@ static void sun3_irq_update(Sun3MachineState *m)
     if (m->intreg & SUN3_IREG_SOFT_3) {
         pend |= 1 << 3;
     }
-    if (m->clock_latch && (m->intreg & SUN3_IREG_CLOCK_ENAB_5)) {
+    if (m->clock_latch[SUN3_IPL_CLOCK] &&
+        (m->intreg & SUN3_IREG_CLOCK_ENAB_5)) {
         pend |= 1 << SUN3_IPL_CLOCK;
     }
-    if (m->clock_latch && (m->intreg & SUN3_IREG_CLOCK_ENAB_7)) {
+    if (m->clock_latch[SUN3_IPL_CLOCK_NMI] &&
+        (m->intreg & SUN3_IREG_CLOCK_ENAB_7)) {
         pend |= 1 << SUN3_IPL_CLOCK_NMI;
     }
     if (!(m->intreg & SUN3_IREG_ALL_ENAB)) {
@@ -309,13 +405,15 @@ static void sun3_clock_irq(void *opaque, int n, int level)
     Sun3MachineState *m = opaque;
 
     /*
-     * The board latches the ICM7170's interrupt output; the OS clears
-     * the latch by momentarily dropping the clock enable bit in the
-     * interrupt register (it also reads the 7170's status register,
-     * which drops this line again).
+     * The board latches the ICM7170's interrupt output, separately for
+     * each of the two clock levels; the OS clears a latch by momentarily
+     * dropping that level's enable bit in the interrupt register (it
+     * also reads the 7170's status register, which drops this line
+     * again).
      */
     if (level) {
-        m->clock_latch = true;
+        m->clock_latch[SUN3_IPL_CLOCK] = true;
+        m->clock_latch[SUN3_IPL_CLOCK_NMI] = true;
     }
     sun3_irq_update(m);
 }
@@ -333,8 +431,11 @@ static void sun3_intreg_write(void *opaque, hwaddr addr, uint64_t val,
     Sun3MachineState *m = opaque;
 
     qemu_log_mask(CPU_LOG_INT, "sun3: intreg <- %02x\n", (uint8_t)val);
-    if (!(val & SUN3_IREG_CLOCK_ENAB_5) && !(val & SUN3_IREG_CLOCK_ENAB_7)) {
-        m->clock_latch = false;
+    if (!(val & SUN3_IREG_CLOCK_ENAB_5)) {
+        m->clock_latch[SUN3_IPL_CLOCK] = false;
+    }
+    if (!(val & SUN3_IREG_CLOCK_ENAB_7)) {
+        m->clock_latch[SUN3_IPL_CLOCK_NMI] = false;
     }
     m->intreg = val;
     sun3_irq_update(m);
@@ -813,6 +914,430 @@ static const M68kFCOps sun3_fc_ops = {
     .moves = sun3_fc_moves,
 };
 
+/* --- DVMA --- */
+
+/*
+ * Move a run of bytes between a device's 24-bit DVMA address and memory
+ * through the Sun-3 MMU: the same segment/page-map walk the CPU uses, so
+ * the REF/MOD bits are kept and an invalid or protected page faults the
+ * transfer (the caller latches its bus-error status bit).  Chunked at
+ * 8KB page boundaries like any other bus master.
+ */
+static bool sun3_dvma_rw(Sun3MachineState *m, uint32_t dva, uint8_t *buf,
+                         unsigned len, bool is_write)
+{
+    MMUAccessType access = is_write ? MMU_DATA_STORE : MMU_DATA_LOAD;
+    uint8_t saved_buserr = m->buserr;
+
+    while (len) {
+        uint32_t va = SUN3_DVMA_BASE | (dva & SUN3_DVMA_MASK);
+        unsigned chunk = MIN(len, SUN3_PAGE_SIZE - (va & SUN3_PAGE_MASK));
+        hwaddr pa;
+        int prot;
+
+        if (!sun3_mmu_translate(m, va, access, true, &pa, &prot)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sun3: DVMA %s fault dva=%06x va=%08x ctx=%d\n",
+                          is_write ? "write" : "read", dva & SUN3_DVMA_MASK,
+                          va, m->context);
+            /* a DVMA fault is the device's error, not a CPU bus error */
+            m->buserr = saved_buserr;
+            return false;
+        }
+        if (address_space_rw(&address_space_memory, pa,
+                             MEMTXATTRS_UNSPECIFIED, buf, chunk,
+                             is_write) != MEMTX_OK) {
+            m->buserr = saved_buserr;
+            return false;
+        }
+        buf += chunk;
+        dva += chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+/* --- "si" SCSI: NCR5380 + Am9516 UDC + FIFO --- */
+
+static void sun3_si_update_irq(Sun3MachineState *m)
+{
+    bool level = (m->si_csr & SI_CSR_INTR_EN) && (m->si_sbc_irq || m->udc_ip);
+
+    qemu_set_irq(m->irqs[SUN3_IRQ_SRC_SI], level);
+}
+
+static void sun3_si_sbc_irq(void *opaque, int n, int level)
+{
+    Sun3MachineState *m = opaque;
+
+    m->si_sbc_irq = level;
+    sun3_si_update_irq(m);
+}
+
+/*
+ * Run the DMA engine: while the UDC channel has words left and the 5380
+ * is armed with a byte to move, shuttle data between the SCSI data phase
+ * and DVMA memory a word at a time.  The FIFO assembles bytes into
+ * big-endian words; an odd trailing byte on a receive stays in the FIFO
+ * data latch (high byte) for the driver to pick up, exactly as the PROM
+ * and NetBSD do.  fifo_count is the driver-loaded byte counter, which
+ * counts down per byte moved; the UDC count is in words.
+ */
+static void sun3_si_dma_run(Sun3MachineState *m)
+{
+    NCR5380State *n = &m->si_sbc;
+    int dir = ncr5380_dma_direction(n);
+    bool out;
+
+    if (!m->udc_active || dir < 0) {
+        return;
+    }
+    out = dir == 1;
+    if (!!(m->si_csr & SI_CSR_SEND) != out) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sun3: si DMA direction mismatch: csr %04x, 5380 %s\n",
+                      m->si_csr, out ? "send" : "receive");
+    }
+    while (m->udc_count > 0 && ncr5380_pdma_ready(n, out)) {
+        uint8_t w[2];
+
+        if (out) {
+            if (!sun3_dvma_rw(m, m->udc_dma_addr, w, 2, false)) {
+                m->si_csr |= SI_CSR_DMA_BUS_ERR;
+                m->udc_active = false;
+                break;
+            }
+            m->udc_dma_addr += 2;
+            m->udc_count--;
+            m->si_fifo_data = (w[0] << 8) | w[1];
+            for (int i = 0; i < 2; i++) {
+                /* the byte counter stops the pad byte of an odd send */
+                if (m->si_fifo_count && ncr5380_pdma_ready(n, true)) {
+                    ncr5380_pdma_write(n, w[i]);
+                    m->si_fifo_count--;
+                }
+            }
+        } else {
+            w[0] = ncr5380_pdma_read(n);
+            m->si_fifo_count--;
+            if (!ncr5380_pdma_ready(n, false)) {
+                /* odd trailing byte: left in the FIFO latch, high byte */
+                m->si_fifo_data = w[0] << 8;
+                break;
+            }
+            w[1] = ncr5380_pdma_read(n);
+            m->si_fifo_count--;
+            m->si_fifo_data = (w[0] << 8) | w[1];
+            if (!sun3_dvma_rw(m, m->udc_dma_addr, w, 2, true)) {
+                m->si_csr |= SI_CSR_DMA_BUS_ERR;
+                m->udc_active = false;
+                break;
+            }
+            m->udc_dma_addr += 2;
+            m->udc_count--;
+        }
+    }
+    if (m->udc_active && m->udc_count == 0) {
+        /*
+         * Chain complete: /EOP to the 5380 (which raises its own
+         * interrupt -> SBC_IP when the target then changes phase).
+         *
+         * DMA_IP is NOT a normal-completion bit: both drivers treat it
+         * as an error after a transfer.  SunOS's si_cmdwait waits for
+         * SBC_IP (csr & 0x4200) and then fails the command outright if
+         * csr & 0x4100 (DMA_CONFLICT | DMA_IP) is set -- munix_sun3
+         * 0xe067660..0xe06766a, `bne` into its d7=3/si_reset path, which
+         * is exactly the "resetting scsi bus" this model used to provoke
+         * on every transfer -- and the PROM decodes bit 8 on its own as
+         * "dma overrun" (ROM 0xfef8c7a).  So raise it only when the
+         * transfer really did end early: the count ran out while the
+         * target still had data to hand over.
+         */
+        m->udc_active = false;
+        ncr5380_dma_eop(n);
+        if (ncr5380_pdma_ready(n, out)) {
+            m->udc_ip = true;
+        }
+    }
+    sun3_si_update_irq(m);
+}
+
+/*
+ * A DMA transfer takes time on the real board, and the drivers rely on
+ * it: SunOS's si_sbc_dma_setup reads the 5380's reset-interrupt register
+ * right after writing the DMA start register (MINIROOT kernel pcs
+ * 0x0e0704be / 0x0e071eda), which on hardware happens while the first
+ * bytes are still moving.  Completing the whole transfer inside the
+ * start write would let that read clear the completion interrupt before
+ * the driver's poll (sipoll: csr & SBC_IP) ever sees it.  So the engine
+ * runs from a timer: a small setup latency plus ~100 ns per byte.
+ */
+#define SUN3_SI_DMA_LATENCY_NS  20000
+#define SUN3_SI_DMA_NS_PER_BYTE 100
+
+static void sun3_si_dma_schedule(Sun3MachineState *m)
+{
+    int64_t delay;
+
+    if (!m->udc_active || ncr5380_dma_direction(&m->si_sbc) < 0 ||
+        timer_pending(&m->si_dma_timer)) {
+        return;
+    }
+    delay = SUN3_SI_DMA_LATENCY_NS +
+            (int64_t)m->udc_count * 2 * SUN3_SI_DMA_NS_PER_BYTE;
+    timer_mod(&m->si_dma_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay);
+}
+
+static void sun3_si_dma_timer_cb(void *opaque)
+{
+    sun3_si_dma_run(opaque);
+}
+
+/* the 5380's DRQ output: a byte is ready on the SCSI side */
+static void sun3_si_drq(void *opaque, int n, int level)
+{
+    Sun3MachineState *m = opaque;
+
+    if (level) {
+        sun3_si_dma_schedule(m);
+    }
+}
+
+static void sun3_si_udc_reset(Sun3MachineState *m)
+{
+    timer_del(&m->si_dma_timer);
+    m->udc_active = false;
+    m->udc_count = 0;
+    m->udc_ip = false;
+}
+
+/* UDC start-chain: fetch the command table from DVMA and arm the channel */
+static void sun3_si_udc_start(Sun3MachineState *m)
+{
+    uint32_t car = ((m->udc_car_hi & 0xff00) << 8) | m->udc_car_lo;
+    uint8_t raw[UDC_TBL_WORDS * 2];
+    uint16_t tbl[UDC_TBL_WORDS];
+    int i;
+
+    if (!sun3_dvma_rw(m, car, raw, sizeof(raw), false)) {
+        m->si_csr |= SI_CSR_DMA_BUS_ERR;
+        sun3_si_update_irq(m);
+        return;
+    }
+    for (i = 0; i < UDC_TBL_WORDS; i++) {
+        tbl[i] = lduw_be_p(&raw[i * 2]);
+    }
+    m->udc_dma_addr = ((tbl[UDC_TBL_ADDRH] & 0xff00) << 8) |
+                      tbl[UDC_TBL_ADDRL];
+    m->udc_count = tbl[UDC_TBL_COUNT];
+    m->udc_active = true;
+    m->udc_ip = false;
+    qemu_log_mask(CPU_LOG_MMU,
+                  "sun3: si UDC start: table@%06x rsel=%04x addr=%06x "
+                  "count=%u words cmr=%02x%02x csr=%04x fifo_count=%u\n",
+                  car, tbl[UDC_TBL_RSEL], m->udc_dma_addr, m->udc_count,
+                  tbl[UDC_TBL_CMRH], tbl[UDC_TBL_CMRL], m->si_csr,
+                  m->si_fifo_count);
+    sun3_si_dma_schedule(m);
+}
+
+static void sun3_si_udc_write(Sun3MachineState *m, uint16_t val)
+{
+    switch (m->udc_addr) {
+    case UDC_ADR_COMMAND:
+        switch (val & 0xff) {
+        case UDC_CMD_RESET:
+            sun3_si_udc_reset(m);
+            sun3_si_update_irq(m);
+            break;
+        case UDC_CMD_CIE:
+            /* completion interrupts are always presented (DMA_IP) */
+            break;
+        case UDC_CMD_START_CHN:
+            sun3_si_udc_start(m);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "sun3: si UDC command %02x\n",
+                          (unsigned)val);
+            break;
+        }
+        break;
+    case UDC_ADR_MODE:
+        m->udc_mode = val;
+        break;
+    case UDC_ADR_CAR_HIGH:
+        m->udc_car_hi = val;
+        break;
+    case UDC_ADR_CAR_LOW:
+        m->udc_car_lo = val;
+        break;
+    case UDC_ADR_COUNT:
+        m->udc_count = val;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "sun3: si UDC reg %02x <- %04x\n",
+                      m->udc_addr, (unsigned)val);
+        break;
+    }
+}
+
+static uint16_t sun3_si_udc_read(Sun3MachineState *m)
+{
+    switch (m->udc_addr) {
+    case UDC_ADR_COUNT:
+        return m->udc_count;
+    case UDC_ADR_MODE:
+        return m->udc_mode;
+    case UDC_ADR_CAR_HIGH:
+        return m->udc_car_hi;
+    case UDC_ADR_CAR_LOW:
+        return m->udc_car_lo;
+    default:
+        return 0;
+    }
+}
+
+static uint16_t sun3_si_csr_read(Sun3MachineState *m)
+{
+    uint16_t v = m->si_csr & (SI_CSR_RW_BITS | SI_CSR_DMA_BUS_ERR |
+                              SI_CSR_DMA_CONFLICT);
+
+    /* the FIFO drains synchronously: never full, always empty */
+    v |= SI_CSR_FIFO_EMPTY;
+    if (m->si_sbc_irq) {
+        v |= SI_CSR_SBC_IP;
+    }
+    if (m->udc_ip) {
+        v |= SI_CSR_DMA_IP;
+    }
+    if (m->udc_active) {
+        v |= SI_CSR_DMA_ACTIVE;
+    }
+    return v;
+}
+
+static void sun3_si_csr_write(Sun3MachineState *m, uint16_t val)
+{
+    uint16_t old = m->si_csr;
+
+    m->si_csr = (m->si_csr & ~SI_CSR_RW_BITS) | (val & SI_CSR_RW_BITS);
+    if (!(val & SI_CSR_SCSI_RES)) {
+        /* held in reset: the 5380, the UDC and the error latches */
+        if (old & SI_CSR_SCSI_RES) {
+            device_cold_reset(DEVICE(&m->si_sbc));
+        }
+        sun3_si_udc_reset(m);
+        m->si_csr &= ~(SI_CSR_DMA_BUS_ERR | SI_CSR_DMA_CONFLICT);
+    }
+    if (!(val & SI_CSR_FIFO_RES)) {
+        m->si_fifo_data = 0;
+    }
+    sun3_si_update_irq(m);
+}
+
+static uint64_t sun3_si_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Sun3MachineState *m = opaque;
+    unsigned reg = addr & ~1;
+    uint16_t v;
+
+    switch (reg) {
+    case SI_UDC_DATA:
+        v = sun3_si_udc_read(m);
+        break;
+    case SI_UDC_ADDR:
+        v = m->udc_addr;
+        break;
+    case SI_FIFO_DATA:
+        v = m->si_fifo_data;
+        break;
+    case SI_FIFO_COUNT:
+        v = m->si_fifo_count;
+        break;
+    case SI_CSR:
+        v = sun3_si_csr_read(m);
+        break;
+    default:
+        v = m->si_scratch[reg / 2];
+        break;
+    }
+    if (size == 1) {
+        v = (addr & 1) ? v & 0xff : v >> 8;
+    }
+    qemu_log_mask(CPU_LOG_MMU, "sun3: si rd %02x.%u -> %04x\n",
+                  (unsigned)addr, size, v);
+    return v;
+}
+
+static void sun3_si_write(void *opaque, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    Sun3MachineState *m = opaque;
+    unsigned reg = addr & ~1;
+    uint16_t v = val;
+
+    qemu_log_mask(CPU_LOG_MMU, "sun3: si wr %02x.%u <- %04x\n",
+                  (unsigned)addr, size, (unsigned)val);
+    if (size == 1) {
+        uint16_t cur = sun3_si_read(m, reg, 2);
+
+        v = (addr & 1) ? (cur & 0xff00) | (val & 0xff)
+                       : (cur & 0x00ff) | ((val & 0xff) << 8);
+    }
+    switch (reg) {
+    case SI_UDC_DATA:
+        sun3_si_udc_write(m, v);
+        break;
+    case SI_UDC_ADDR:
+        m->udc_addr = v;
+        break;
+    case SI_FIFO_DATA:
+        m->si_fifo_data = v;
+        break;
+    case SI_FIFO_COUNT:
+        m->si_fifo_count = v;
+        break;
+    case SI_CSR:
+        sun3_si_csr_write(m, v);
+        break;
+    default:
+        m->si_scratch[reg / 2] = v;
+        break;
+    }
+}
+
+/*
+ * 16-bit register file; the SunOS si driver also does 32-bit stores to
+ * the VME dma_addr/dma_count pair (si_sbc_dma_setup), split into halves.
+ */
+static const MemoryRegionOps sun3_si_ops = {
+    .read = sun3_si_read,
+    .write = sun3_si_write,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
+static void sun3_si_reset(Sun3MachineState *m)
+{
+    m->si_csr = 0;
+    m->si_fifo_count = 0;
+    m->si_fifo_data = 0;
+    memset(m->si_scratch, 0, sizeof(m->si_scratch));
+    m->si_sbc_irq = false;
+    m->udc_addr = 0;
+    m->udc_car_hi = m->udc_car_lo = m->udc_mode = 0;
+    m->udc_dma_addr = 0;
+    sun3_si_udc_reset(m);
+}
+
 /* --- IDPROM --- */
 
 static void sun3_build_idprom(Sun3MachineState *m, const MACAddr *mac)
@@ -849,12 +1374,13 @@ static void sun3_machine_reset(void *opaque)
     m->udvma = 0;
     m->intreg = 0;
     m->irq_sources = 0;
-    m->clock_latch = false;
+    memset(m->clock_latch, 0, sizeof(m->clock_latch));
     m->memerr_csr = 0;
     if (m->parity_poison) {
         g_hash_table_remove_all(m->parity_poison);
         sun3_parity_overlay_update(m);
     }
+    sun3_si_reset(m);
 
     cpu_reset(cs);
     /*
@@ -1024,6 +1550,29 @@ static void sun3_init(MachineState *machine)
                             SUN3_OBIO_CLOCK);
     sysbus_connect_irq(sbd, 0,
                        qemu_allocate_irq(sun3_clock_irq, m, 0));
+
+    /*
+     * si SCSI: the NCR5380 (byte-spaced registers) on top of the DMA/CSR
+     * block, interrupt level 2 through the machine's per-source line.
+     */
+    object_initialize_child(OBJECT(machine), "si", &m->si_sbc, TYPE_NCR5380);
+    qdev_prop_set_uint8(DEVICE(&m->si_sbc), "reg-shift", 0);
+    sysbus_realize(SYS_BUS_DEVICE(&m->si_sbc), &error_fatal);
+    memory_region_init_io(&m->si_mr, OBJECT(machine), &sun3_si_ops, m,
+                          "sun3.si", SUN3_SI_SIZE);
+    memory_region_add_subregion(sysmem,
+                                SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
+                                SUN3_OBIO_SI, &m->si_mr);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(&m->si_sbc), 0,
+                            SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) + SUN3_OBIO_SI,
+                            1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&m->si_sbc), 0,
+                       qemu_allocate_irq(sun3_si_sbc_irq, m, 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&m->si_sbc), 1,
+                       qemu_allocate_irq(sun3_si_drq, m, 0));
+    timer_init_ns(&m->si_dma_timer, QEMU_CLOCK_VIRTUAL,
+                  sun3_si_dma_timer_cb, m);
+    scsi_bus_legacy_handle_cmdline(&m->si_sbc.bus);
 
     sun3_build_idprom(m, &mac);
 }
