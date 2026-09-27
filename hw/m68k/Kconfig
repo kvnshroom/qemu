@@ -56,3 +56,10 @@ config SUN3
     select LANCE
     select NCR5380
     select SUN_BWTWO
+
+config SUN3X
+    bool
+    default y
+    depends on M68K
+    select ESCC
+    select M68K_IRQC
