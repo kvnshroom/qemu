@@ -1264,31 +1264,47 @@ static void sunmouse_sync(DeviceState *dev)
     s->sunmouse_buttons &= ~0x80;
     trace_escc_sunmouse_event(s->sunmouse_dx, s->sunmouse_dy,
                               s->sunmouse_buttons);
-    ch = 0x80 | 0x7; /* protocol start byte, no buttons pressed */
-    ch ^= s->sunmouse_buttons;
-    put_queue(s, ch);
 
-    ch = s->sunmouse_dx;
-    if (ch > 127) {
-        ch = 127;
-    } else if (ch < -127) {
-        ch = -127;
-    }
-    put_queue(s, ch & 0xff);
-    s->sunmouse_dx -= ch;
+    /*
+     * A packet carries at most +-127 per axis.  A larger host motion is
+     * sent as consecutive packets, as a real mouse would produce; leaving
+     * the remainder for the next sync delivered it together with the next
+     * button event, i.e. a click landed where the pointer had not yet
+     * arrived (SunView/OpenWindows focused the wrong window).  Whatever
+     * does not fit in the queue is dropped whole, so the byte stream stays
+     * aligned on the packet header.
+     */
+    do {
+        if (s->queue.count + 5 > ESCC_SERIO_QUEUE_SIZE) {
+            s->sunmouse_dx = s->sunmouse_dy = 0;
+            break;
+        }
+        ch = 0x80 | 0x7; /* protocol start byte, no buttons pressed */
+        ch ^= s->sunmouse_buttons;
+        put_queue(s, ch);
 
-    ch = s->sunmouse_dy;
-    if (ch > 127) {
-        ch = 127;
-    } else if (ch < -127) {
-        ch = -127;
-    }
-    put_queue(s, ch & 0xff);
-    s->sunmouse_dy -= ch;
+        ch = s->sunmouse_dx;
+        if (ch > 127) {
+            ch = 127;
+        } else if (ch < -127) {
+            ch = -127;
+        }
+        put_queue(s, ch & 0xff);
+        s->sunmouse_dx -= ch;
 
-    /* MSC protocol specifies two extra motion bytes */
-    put_queue(s, 0);
-    put_queue(s, 0);
+        ch = s->sunmouse_dy;
+        if (ch > 127) {
+            ch = 127;
+        } else if (ch < -127) {
+            ch = -127;
+        }
+        put_queue(s, ch & 0xff);
+        s->sunmouse_dy -= ch;
+
+        /* MSC protocol specifies two extra motion bytes */
+        put_queue(s, 0);
+        put_queue(s, 0);
+    } while (s->sunmouse_dx != 0 || s->sunmouse_dy != 0);
 }
 
 static const QemuInputHandler sunmouse_handler = {
