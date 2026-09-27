@@ -1,0 +1,434 @@
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index c1e0d67b7cf5..f69bf103e77e 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -205,6 +205,18 @@ config SERIAL_MVME147_SCC
+ 	help
+ 	  This driver supports the Zilog SCC present on MVME147
+ 
++config SERIAL_SUN3X_SCC
++	bool "Sun 3/80 (sun3x) Z8530 serial console support"
++	depends on SUN3X
++	select SERIAL_CORE
++	select SERIAL_CORE_CONSOLE
++	default y
++	help
++	  This driver supports the Zilog Z8530 (zs) serial console on the
++	  Sun 3/80 (sun3x).  It drives channel A of the console zs directly
++	  and provides an interactive console=ttyS0, replacing the earlier
++	  hvc_sun3 console that tunnelled through the boot PROM.
++
+ config SERIAL_AVME352
+ 	tristate "AVAL DATA AVME-352 VMEbus serial I/O card support"
+ 	depends on OF
+diff --git a/drivers/tty/serial/Makefile b/drivers/tty/serial/Makefile
+index 0bd21837641e..865cf817c34e 100644
+--- a/drivers/tty/serial/Makefile
++++ b/drivers/tty/serial/Makefile
+@@ -59,6 +59,7 @@ obj-$(CONFIG_SERIAL_MSM)		+= msm_serial.o
+ obj-$(CONFIG_SERIAL_MUX)		+= mux.o
+ obj-$(CONFIG_SERIAL_MVEBU_UART)		+= mvebu-uart.o
+ obj-$(CONFIG_SERIAL_MVME147_SCC)	+= serial_mvme147_scc.o
++obj-$(CONFIG_SERIAL_SUN3X_SCC)		+= sun3x_scc.o
+ obj-$(CONFIG_SERIAL_AVME352)		+= avme352.o
+ obj-$(CONFIG_SERIAL_MXS_AUART)		+= mxs-auart.o
+ obj-$(CONFIG_SERIAL_OMAP)		+= omap-serial.o
+diff --git a/drivers/tty/serial/sun3x_scc.c b/drivers/tty/serial/sun3x_scc.c
+new file mode 100644
+index 000000000000..6a5d28066304
+--- /dev/null
++++ b/drivers/tty/serial/sun3x_scc.c
+@@ -0,0 +1,393 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Sun 3/80 ("sun3x") Zilog Z8530 (zs) serial console + tty driver.
++ *
++ * The Sun-3x console is channel A of the Z8530 (ESCC) at SUN3X_ZS1
++ * (0x62000000).  Prior to this driver the sun3x console tunnelled through
++ * the resident boot PROM's putchar/getchar romvec stubs via hvc_sun3; this
++ * driver instead talks to the zs directly, giving a real console=ttyS0 and
++ * an interactive tty on the native hardware, matching how mvme147/mvme16x
++ * drive their Z8530.
++ *
++ * The zs interrupt is not wired to the CPU on the QEMU sun3x model (the
++ * only autovectored source is the level-5 clock tick), so RX is serviced by
++ * a lightweight poll timer and TX is done by polling RR0.TX_EMPTY.  Both are
++ * cheap: the on-board I/O is transparently (identity) mapped and
++ * cache-inhibited by head.S (TT1 covers 0x40000000..0x80000000), so the zs
++ * registers are reachable directly at their physical addresses.
++ *
++ * Register access follows the standard Z8530 two-step (write the register
++ * number to the control port, then read/write the value), except RR0/WR0 and
++ * the data port which are addressed directly.  With it_shift==1 the QEMU ESCC
++ * places channel A's control register at +4 and its data register at +6.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ */
++
++#include <linux/console.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/serial_core.h>
++#include <linux/timer.h>
++#include <linux/tty.h>
++#include <linux/tty_flip.h>
++
++#include <asm/setup.h>
++#include <asm/sun3x.h>
++
++#define SUN3X_SCC_NAME		"sun3x-scc"
++#define SUN3X_SCC_TTY_PREFIX	"ttyS"
++
++/* Console channel A of the zs at SUN3X_ZS1 (it_shift==1 ESCC layout):
++ *   channel = (addr >> 2) & 1  (A == 1)
++ *   reg     = (addr >> 1) & 1  (ctrl == 0, data == 1)
++ * so ch-A control is at +4 and ch-A data at +6.
++ */
++#define ZSA_CTRL		((volatile u8 *)(SUN3X_ZS1 + 4))
++#define ZSA_DATA		((volatile u8 *)(SUN3X_ZS1 + 6))
++
++/* RR0 - status */
++#define RR0_RX_AVAIL		0x01
++#define RR0_TX_EMPTY		0x04
++
++/* WR3 - receive control */
++#define WR3_RX_8BITS		0xc0
++#define WR3_RX_ENABLE		0x01
++
++/* WR4 - tx/rx misc: no parity, 1 stop bit, x16 clock (async) */
++#define WR4_8N1_X16		0x44
++
++/* WR5 - transmit control */
++#define WR5_TX_8BITS		0x60
++#define WR5_TX_ENABLE		0x08
++#define WR5_RTS			0x02
++#define WR5_DTR			0x80
++
++/*
++ * The real Z8530 needs a short recovery time between successive register
++ * accesses; a couple of nops are plenty and are harmless under QEMU.
++ */
++static inline void zs_recovery_delay(void)
++{
++	__asm__ __volatile__("nop; nop");
++}
++
++static void zs_write_reg(u8 reg, u8 val)
++{
++	if (reg) {
++		*ZSA_CTRL = reg;
++		zs_recovery_delay();
++	}
++	*ZSA_CTRL = val;
++	zs_recovery_delay();
++}
++
++/* Read RR0 (status).  The chip auto-resets the register pointer to 0 after
++ * every access, so the control port reads back RR0 directly.
++ */
++static inline u8 zs_read_status(void)
++{
++	return *ZSA_CTRL;
++}
++
++static struct uart_port sun3x_scc_port;
++static struct timer_list sun3x_scc_rx_timer;
++static bool sun3x_scc_rx_active;
++
++static void sun3x_scc_hw_init(void)
++{
++	/* async, no parity, 1 stop, x16 clock */
++	zs_write_reg(4, WR4_8N1_X16);
++	/* 8-bit rx/tx, not yet enabled */
++	zs_write_reg(3, WR3_RX_8BITS);
++	zs_write_reg(5, WR5_TX_8BITS | WR5_RTS | WR5_DTR);
++	/* enable rx and tx */
++	zs_write_reg(3, WR3_RX_8BITS | WR3_RX_ENABLE);
++	zs_write_reg(5, WR5_TX_8BITS | WR5_TX_ENABLE | WR5_RTS | WR5_DTR);
++}
++
++/* --- polled receive --- */
++
++static void sun3x_scc_rx_poll(struct timer_list *t)
++{
++	struct uart_port *port = &sun3x_scc_port;
++	unsigned long flags;
++	int pushed = 0;
++
++	uart_port_lock_irqsave(port, &flags);
++	while (zs_read_status() & RR0_RX_AVAIL) {
++		u8 ch = *ZSA_DATA;
++
++		port->icount.rx++;
++		uart_insert_char(port, 0, 0, ch, TTY_NORMAL);
++		pushed = 1;
++	}
++	uart_port_unlock_irqrestore(port, flags);
++
++	if (pushed)
++		tty_flip_buffer_push(&port->state->port);
++
++	if (sun3x_scc_rx_active)
++		mod_timer(&sun3x_scc_rx_timer, jiffies + 1);
++}
++
++/* --- polled transmit --- */
++
++static inline void sun3x_scc_put_char(u8 ch)
++{
++	while (!(zs_read_status() & RR0_TX_EMPTY))
++		cpu_relax();
++	*ZSA_DATA = ch;
++}
++
++static void sun3x_scc_start_tx(struct uart_port *port)
++{
++	u8 ch;
++
++	/* Called with the port lock held.  There is no TX interrupt, so drain
++	 * the whole FIFO here, busy-waiting for TX_EMPTY per character (which
++	 * is essentially instantaneous under QEMU).
++	 */
++	uart_port_tx(port, ch, true, sun3x_scc_put_char(ch));
++}
++
++static void sun3x_scc_stop_tx(struct uart_port *port)
++{
++}
++
++static void sun3x_scc_stop_rx(struct uart_port *port)
++{
++}
++
++static unsigned int sun3x_scc_tx_empty(struct uart_port *port)
++{
++	return (zs_read_status() & RR0_TX_EMPTY) ? TIOCSER_TEMT : 0;
++}
++
++static unsigned int sun3x_scc_get_mctrl(struct uart_port *port)
++{
++	return TIOCM_CAR | TIOCM_CTS | TIOCM_DSR;
++}
++
++static void sun3x_scc_set_mctrl(struct uart_port *port, unsigned int mctrl)
++{
++}
++
++static void sun3x_scc_break_ctl(struct uart_port *port, int break_state)
++{
++}
++
++static int sun3x_scc_startup(struct uart_port *port)
++{
++	sun3x_scc_hw_init();
++
++	sun3x_scc_rx_active = true;
++	mod_timer(&sun3x_scc_rx_timer, jiffies + 1);
++
++	return 0;
++}
++
++static void sun3x_scc_shutdown(struct uart_port *port)
++{
++	sun3x_scc_rx_active = false;
++	timer_delete_sync(&sun3x_scc_rx_timer);
++}
++
++static void sun3x_scc_set_termios(struct uart_port *port,
++				  struct ktermios *termios,
++				  const struct ktermios *old)
++{
++	/* The zs baud rate divisor is irrelevant to the QEMU character
++	 * backend; keep 8N1 and just accept whatever speed is requested.
++	 */
++}
++
++static const char *sun3x_scc_type(struct uart_port *port)
++{
++	return "Z8530";
++}
++
++static void sun3x_scc_release_port(struct uart_port *port)
++{
++}
++
++static int sun3x_scc_request_port(struct uart_port *port)
++{
++	return 0;
++}
++
++static void sun3x_scc_config_port(struct uart_port *port, int flags)
++{
++	/* A non-PORT_UNKNOWN type is required for the serial core to register
++	 * the console from uart_configure_port().  The zs is a Zilog ESCC.
++	 */
++	if (flags & UART_CONFIG_TYPE)
++		port->type = PORT_PMAC_ZILOG;
++}
++
++static int sun3x_scc_verify_port(struct uart_port *port,
++				 struct serial_struct *ser)
++{
++	return -EINVAL;
++}
++
++static const struct uart_ops sun3x_scc_uops = {
++	.tx_empty	= sun3x_scc_tx_empty,
++	.set_mctrl	= sun3x_scc_set_mctrl,
++	.get_mctrl	= sun3x_scc_get_mctrl,
++	.start_tx	= sun3x_scc_start_tx,
++	.stop_tx	= sun3x_scc_stop_tx,
++	.stop_rx	= sun3x_scc_stop_rx,
++	.break_ctl	= sun3x_scc_break_ctl,
++	.startup	= sun3x_scc_startup,
++	.shutdown	= sun3x_scc_shutdown,
++	.set_termios	= sun3x_scc_set_termios,
++	.type		= sun3x_scc_type,
++	.release_port	= sun3x_scc_release_port,
++	.request_port	= sun3x_scc_request_port,
++	.config_port	= sun3x_scc_config_port,
++	.verify_port	= sun3x_scc_verify_port,
++};
++
++/* --- console --- */
++
++static void sun3x_scc_console_putchar(struct uart_port *port, unsigned char ch)
++{
++	sun3x_scc_put_char(ch);
++}
++
++static void sun3x_scc_console_write(struct console *co, const char *s,
++				    unsigned int count)
++{
++	struct uart_port *port = &sun3x_scc_port;
++	unsigned long flags;
++	int locked = 1;
++
++	if (oops_in_progress)
++		locked = uart_port_trylock_irqsave(port, &flags);
++	else
++		uart_port_lock_irqsave(port, &flags);
++
++	uart_console_write(port, s, count, sun3x_scc_console_putchar);
++
++	if (locked)
++		uart_port_unlock_irqrestore(port, flags);
++}
++
++static int sun3x_scc_console_setup(struct console *co, char *options)
++{
++	if (co->index != 0)
++		return -ENODEV;
++
++	/*
++	 * This runs both at console_initcall (before the uart port has been
++	 * added, so port->state is NULL) and again from uart_configure_port().
++	 * The console write path only touches the zs registers directly, so we
++	 * just (re)initialise the hardware here and deliberately avoid
++	 * uart_set_options(), which would dereference the not-yet-allocated
++	 * port state during the early call.  Baud/termios are applied when the
++	 * tty is opened.
++	 */
++	sun3x_scc_hw_init();
++
++	return 0;
++}
++
++static struct uart_driver sun3x_scc_uart_driver;
++
++static struct console sun3x_scc_console = {
++	.name	= SUN3X_SCC_TTY_PREFIX,
++	.write	= sun3x_scc_console_write,
++	.device	= uart_console_device,
++	.setup	= sun3x_scc_console_setup,
++	.flags	= CON_PRINTBUFFER,
++	.index	= -1,
++	.data	= &sun3x_scc_uart_driver,
++};
++
++static struct uart_driver sun3x_scc_uart_driver = {
++	.owner		= THIS_MODULE,
++	.driver_name	= SUN3X_SCC_NAME,
++	.dev_name	= SUN3X_SCC_TTY_PREFIX,
++	.nr		= 1,
++	.cons		= &sun3x_scc_console,
++};
++
++static void sun3x_scc_init_port(void)
++{
++	struct uart_port *port = &sun3x_scc_port;
++	static bool done;
++
++	if (done)
++		return;
++	done = true;
++
++	port->ops	= &sun3x_scc_uops;
++	port->type	= PORT_PMAC_ZILOG;
++	port->iotype	= UPIO_MEM;
++	port->flags	= UPF_BOOT_AUTOCONF;
++	port->fifosize	= 1;
++	port->line	= 0;
++	port->mapbase	= (resource_size_t)SUN3X_ZS1;
++	port->membase	= (void __iomem *)SUN3X_ZS1;
++	port->uartclk	= 4915200;	/* zs baud clock, informational */
++	spin_lock_init(&port->lock);
++}
++
++static int __init sun3x_scc_console_init(void)
++{
++	if (!MACH_IS_SUN3X)
++		return -ENODEV;
++
++	sun3x_scc_init_port();
++	register_console(&sun3x_scc_console);
++
++	return 0;
++}
++console_initcall(sun3x_scc_console_init);
++
++static struct platform_device *sun3x_scc_pdev;
++
++static int __init sun3x_scc_init(void)
++{
++	int ret;
++
++	if (!MACH_IS_SUN3X)
++		return -ENODEV;
++
++	timer_setup(&sun3x_scc_rx_timer, sun3x_scc_rx_poll, 0);
++
++	ret = uart_register_driver(&sun3x_scc_uart_driver);
++	if (ret)
++		return ret;
++
++	/* A registered device is required to own the serial core port. */
++	sun3x_scc_pdev = platform_device_register_simple(SUN3X_SCC_NAME, -1,
++							 NULL, 0);
++	if (IS_ERR(sun3x_scc_pdev)) {
++		ret = PTR_ERR(sun3x_scc_pdev);
++		goto err_unregister_driver;
++	}
++
++	sun3x_scc_init_port();
++	sun3x_scc_port.dev = &sun3x_scc_pdev->dev;
++
++	ret = uart_add_one_port(&sun3x_scc_uart_driver, &sun3x_scc_port);
++	if (ret)
++		goto err_unregister_pdev;
++
++	return 0;
++
++err_unregister_pdev:
++	platform_device_unregister(sun3x_scc_pdev);
++err_unregister_driver:
++	uart_unregister_driver(&sun3x_scc_uart_driver);
++	return ret;
++}
++device_initcall(sun3x_scc_init);
++
++MODULE_DESCRIPTION("Sun 3/80 (sun3x) Z8530 serial console driver");
++MODULE_LICENSE("GPL");

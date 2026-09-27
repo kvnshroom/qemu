@@ -1,0 +1,76 @@
+
+ABCGHIJK
+Linux version 7.3.0-rc4-sun3-g84766f53ef59 (dev@claustrum) (m68k-linux-gnu-gcc (GCC) 14.3.0, GNU ld (GNU Binutils) 2.44) #5 Thu Sep 24 10:31:13 UTC 2026
+Saving 46 bytes of bootinfo
+printk: legacy bootconsole [debug0] enabled
+TYPE: Sun 3/80
+Ethernet address: 08:00:20:11:22:33
+Zone ranges:
+  DMA      [mem 0x0000000000000000-0x0000000000ffffff]
+  Normal   empty
+Movable zone start for each node
+Early memory node ranges
+  node   0: [mem 0x0000000000000000-0x0000000000ffffff]
+Initmem setup node 0 [mem 0x0000000000000000-0x0000000000ffffff]
+Kernel command line: console=ttyS0 earlyprintk
+printk: log buffer data + meta data: 65536 + 204800 = 270336 bytes
+Dentry cache hash table entries: 2048 (order: 1, 8192 bytes, linear)
+Inode-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+Sorting __ex_table...
+Built 1 zonelists, mobility grouping on.  Total pages: 4096
+mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+SLUB: HWalign=16, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+NR_IRQS: 200
+Couldn't register vec255 interrupt
+clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+Console: colour dummy device 80x25
+printk: legacy console [ttyS0] enabled
+printk: legacy console [ttyS0] enabled
+printk: legacy bootconsole [debug0] disabled
+printk: legacy bootconsole [debug0] disabled
+Calibrating delay loop... 2118.45 BogoMIPS (lpj=10592256)
+pid_max: default: 32768 minimum: 301
+Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+VFS: Finished mounting rootfs on nullfs
+Memory: 11868K/16384K available (1961K kernel code, 419K rwdata, 1212K rodata, 112K init, 115K bss, 3928K reserved, 0K cma-reserved)
+devtmpfs: initialized
+posixtimers hash table entries: 512 (order: 0, 2048 bytes, linear)
+futex hash table entries: 256 (3072 bytes on 1 NUMA nodes, total 3 KiB, linear).
+DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA pool for atomic allocations
+pps_core: LinuxPPS API ver. 1 registered
+pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+Beginning ww (wound) mutex selftests
+Beginning ww (die) mutex selftests
+All ww mutex selftests passed
+workingset: timestamp_bits=30 (anon: 25) max_order=12 bucket_order=0 (anon: 0)
+Block layer SCSI generic (bsg) driver version 0.4 loaded (major 252)
+io scheduler mq-deadline registered
+io scheduler kyber registered
+io scheduler bfq registered
+sun3x-scc: ttyS0 MMIO:0x62000000 (irq = 0, base_baud = 307200) is a Z8530
+dummy-irq: no IRQ given.  Use irq=N
+Rounding down aligned max_sectors from 4294967295 to 4294967288
+db_root: cannot open: /etc/target
+pps_ldisc: PPS line discipline registered
+Freeing unused kernel image (initmem) memory: 112K
+This architecture does not have kernel memory protection.
+Run /init as init process
+===== Linux/sun3 userspace is up (PID 1 running from initramfs) =====
+Starting an interactive smolsh shell on /dev/console
+smolsh / > 
+*** shell prompt reached
+uname -a
+Linux (none) 7.3.0-rc4-sun3-g84766f53ef59 #5 Thu Sep 24 10:31:13 UTC 2026 m68k nolibc/Linux
+smolsh / > cat /proc/cpuinfo
+CPU:		68030
+MMU:		68030
+FPU:		none
+Clocking:	4178.8MHz
+BogoMips:	2118.45
+Calibration:	10592256 loops
+smolsh / > cat /proc/consoles
+ttyS0                -W- (EC     )  251:0
+smolsh / > echo SUN3X_LINUX_OK
+SUN3X_LINUX_OK
+smolsh / > 
