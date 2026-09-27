@@ -117,6 +117,80 @@ static void ncr5380_update_irq(NCR5380State *s)
     qemu_set_irq(s->irq, level);
 }
 
+/*
+ * Genuine-5380 DMA handshake (non-sun boards).  The chip is "armed" once
+ * DMA mode is set and one of the three DMA start registers has been
+ * written; it then raises DRQ whenever the current data phase has a byte
+ * to move, and the board's DMA engine answers with DACK cycles
+ * (ncr5380_pdma_read/write).
+ */
+static bool ncr5380_dma_armed(NCR5380State *s)
+{
+    return (s->mr & MR_DMA_MODE) && s->dma_mode != 0;
+}
+
+static void ncr5380_update_drq(NCR5380State *s)
+{
+    bool out = s->dma_mode == R_DMASND;
+
+    if (s->sun_mode) {
+        return;
+    }
+    qemu_set_irq(s->drq, ncr5380_dma_armed(s) && ncr5380_pdma_ready(s, out));
+}
+
+/*
+ * The 5380's phase-mismatch interrupt (datasheet: "DMA mode set and the
+ * bus phase does not match the TCR while /REQ is asserted").  It needs
+ * only MR DMA_MODE -- NOT a DMA start-register write -- which is how the
+ * Sun-3/60 si drivers get an interrupt at every phase change: the SunOS
+ * driver arms a command by setting TCR to an impossible phase (4) and
+ * MR DMA_MODE, without ever starting a DMA, and then sleeps (MINIROOT
+ * 0x0e072098..0x0e0720ac: tcr=4, read RPI, mr|=2).  Without this, a
+ * no-data command (TEST UNIT READY) never interrupted and the driver
+ * timed out: "sd0: I/O request timeout" / "si0: resetting scsi bus".
+ *
+ * It is an EDGE on the bus phase, not a level: it is raised only from
+ * ncr5380_set_phase(), i.e. where the target itself changes the phase
+ * lines, never from the MR/TCR register writes.  A level version fires
+ * the instant a driver arms TCR with an impossible phase while data is
+ * still flowing, which made the 3/60's own ufsboot abandon a transfer
+ * mid-way ("si: wrong phase, cbsr 0x64" -- CSB still DATA IN).
+ *
+ * Sun-mode (3/80) boards synthesise their own signalling; left alone.
+ */
+static void ncr5380_update_phase_irq(NCR5380State *s)
+{
+    uint8_t want = ((s->tcr & 0x01) ? CSB_IO : 0)
+                 | ((s->tcr & 0x02) ? CSB_CD : 0)
+                 | ((s->tcr & 0x04) ? CSB_MSG : 0);
+
+    if (s->sun_mode || !s->dev || !(s->mr & MR_DMA_MODE)) {
+        return;
+    }
+    if ((s->csb & CSB_REQ) && want != s->phase) {
+        s->bsr |= BSR_IRQ;
+        ncr5380_update_irq(s);
+    }
+}
+
+int ncr5380_dma_direction(NCR5380State *s)
+{
+    if (!ncr5380_dma_armed(s)) {
+        return -1;
+    }
+    return s->dma_mode == R_DMASND ? 1 : 0;
+}
+
+void ncr5380_dma_eop(NCR5380State *s)
+{
+    s->bsr |= BSR_END_DMA;
+    if (s->mr & MR_ENABLE_EOP) {
+        s->bsr |= BSR_IRQ;
+        ncr5380_update_irq(s);
+    }
+}
+
 static void ncr5380_set_phase(NCR5380State *s, uint8_t phase)
 {
     s->phase = phase;
@@ -140,6 +214,8 @@ static void ncr5380_reset_bus(NCR5380State *s)
     s->collecting = false;
     s->cmd_done = false;
     s->status = 0;
+    s->dma_mode = 0;
+    s->irq_on_data_phase = false;
     s->sun_dma_done = false;
     s->sun_dma_drained_pending = false;
     s->sun_cmd_complete = false;
@@ -189,6 +265,16 @@ static void ncr5380_enter_status(NCR5380State *s)
     if (!(s->icr & ICR_ASSERT_ACK)) {
         s->csb |= CSB_REQ;
     }
+    /*
+     * Genuine 5380: the transfer is over and the target has changed the
+     * phase lines, which with DMA mode set is the "phase mismatch"
+     * interrupt -- how both Sun-3/60 si drivers learn a data phase (or a
+     * no-data command) has finished.  Raised here, after /REQ for the
+     * new phase is up, rather than in ncr5380_set_phase(), which runs a
+     * moment earlier with REQ still down.  DRQ drops with it.
+     */
+    ncr5380_update_phase_irq(s);
+    ncr5380_update_drq(s);
 }
 
 /*
@@ -262,6 +348,22 @@ static void ncr5380_do_command(NCR5380State *s)
      */
     s->dev->unit_attention.key = 0;
     s->bus.unit_attention.key = 0;
+    /*
+     * The SunOS 4.1.1 sun3 si driver arms itself for a phase-change
+     * interrupt and sleeps: before launching a command it writes TCR = 4
+     * -- an impossible phase, so any real phase mismatches it -- and
+     * sets MR DMA_MODE, without writing a DMA start register (MINIROOT
+     * /vmunix 0x0e072098..0x0e0720ac, = munix_sun3 _si_cmd 0xe0723e8:
+     * tcr=4, read RPI, mr|=2).  It then expects an interrupt both when
+     * the target enters the data phase (its handler runs
+     * si_sbc_dma_setup to program the real transfer) and when the
+     * command completes.  Recognise that register signature here, at
+     * command-issue time; the polled drivers (3/60 PROM si, ufsboot,
+     * NetBSD ncr5380sbc) always program TCR with a genuine phase code
+     * (1 DATA IN, 2 COMMAND, ...), never 4, so they are unaffected.
+     */
+    s->irq_on_data_phase = !s->sun_mode && (s->mr & MR_DMA_MODE) &&
+                           s->tcr == 0x04;
     s->cmd_done = false;
     s->sun_dma_done = false;
     s->sun_dma_drained_pending = false;
@@ -310,6 +412,11 @@ static void ncr5380_do_command(NCR5380State *s)
             if (!(s->icr & ICR_ASSERT_ACK)) {
                 s->csb |= CSB_REQ;
             }
+            /* an initiator that armed for it is interrupted here */
+            if (s->irq_on_data_phase) {
+                ncr5380_update_phase_irq(s);
+            }
+            ncr5380_update_drq(s);
         } else {
             ncr5380_enter_status(s);
         }
@@ -327,6 +434,10 @@ static void ncr5380_do_command(NCR5380State *s)
         if (!(s->icr & ICR_ASSERT_ACK)) {
             s->csb |= CSB_REQ;
         }
+        if (s->irq_on_data_phase) {
+            ncr5380_update_phase_irq(s);
+        }
+        ncr5380_update_drq(s);
     }
     /*
      * No-data commands complete during scsi_req_enqueue: the completion
@@ -343,9 +454,25 @@ static void ncr5380_select_target(NCR5380State *s, int id)
     if (s->dev) {
         s->target = id;
         s->csb |= CSB_BSY;              /* target asserted BSY */
-        ncr5380_set_phase(s, PHASE_CMD);
+        if (!s->sun_mode && (s->icr & ICR_ASSERT_ATN)) {
+            /*
+             * Genuine 5380: selection with ATN asserted means the
+             * initiator has a message (IDENTIFY) to send before the
+             * command, so the target goes to MESSAGE OUT first.
+             */
+            ncr5380_set_phase(s, PHASE_MO);
+        } else {
+            ncr5380_set_phase(s, PHASE_CMD);
+        }
         s->csb |= CSB_REQ;
-        s->bsr |= BSR_PHASE_MATCH | BSR_IRQ;
+        s->bsr |= BSR_PHASE_MATCH;
+        if (s->sun_mode) {
+            /*
+             * A real 5380 does not interrupt the initiator on selection;
+             * the 3/80 si contract (sun3x.c) keys on this bit, keep it.
+             */
+            s->bsr |= BSR_IRQ;
+        }
         s->cmd_len = 0;
         ncr5380_update_irq(s);
         trace_ncr5380_select_ok(s->target);
@@ -926,12 +1053,16 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
                 break;
             }
             /*
-             * Selection completes on the transition where SEL and the
-             * data drivers are asserted while BSY is released: the target
-             * ID is then on the data bus (ODR, own-id bit 7 excluded).
+             * Selection completes when SEL and the data drivers are
+             * asserted while BSY is released: the target ID is then on
+             * the data bus (ODR, own-id bit 7 excluded).  The 3/60 PROM
+             * selects without arbitrating (it never asserts BSY: ICR=1
+             * then ICR=5), so the BSY release edge is only required in
+             * sun mode, where it keeps the 3/80 contract byte-exact.
              */
             if ((val & ICR_ASSERT_SEL) && (val & ICR_ASSERT_DATA)
-                && !(val & ICR_ASSERT_BSY) && (old & ICR_ASSERT_BSY)
+                && !(val & ICR_ASSERT_BSY)
+                && (!s->sun_mode || (old & ICR_ASSERT_BSY))
                 && !s->dev) {
                 ncr5380_select(s);
             }
@@ -951,6 +1082,11 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case R_MR:
         s->mr = val;
+        if (!s->sun_mode && !(val & MR_DMA_MODE)) {
+            /* leaving DMA mode disarms the chip and clears END_OF_DMA */
+            s->dma_mode = 0;
+            s->bsr &= ~BSR_END_DMA;
+        }
         if (val & MR_ARBITRATE) {
             /* arbitration always wins on this single-initiator bus */
             s->icr &= ~ICR_ARB_LOST;
@@ -1007,6 +1143,7 @@ static void ncr5380_write(void *opaque, hwaddr addr, uint64_t val,
         s->bsr |= BSR_DRQ;
         break;
     }
+    ncr5380_update_drq(s);
 }
 
 /* initiator asserted ACK: accept/deliver the current byte and drop REQ */
@@ -1026,6 +1163,12 @@ static void ncr5380_ack(NCR5380State *s)
     case PHASE_DO:
         if (s->buf_pos < s->buf_len) {
             s->dbuf[s->buf_pos++] = s->odr;
+        }
+        break;
+    case PHASE_MO:
+        /* message byte from the initiator; IDENTIFY carries the LUN */
+        if (s->odr & 0x80) {
+            s->lun = s->odr & 7;
         }
         break;
     case PHASE_ST:
@@ -1131,6 +1274,16 @@ static void ncr5380_ack_release(NCR5380State *s)
             s->csb |= CSB_REQ;          /* status byte available */
         }
         break;
+    case PHASE_MO:
+        if (s->icr & ICR_ASSERT_ATN) {
+            s->csb |= CSB_REQ;          /* more message bytes to come */
+        } else {
+            /* ATN dropped with the last message byte: on to the command */
+            ncr5380_set_phase(s, PHASE_CMD);
+            s->cmd_len = 0;
+            s->csb |= CSB_REQ;
+        }
+        break;
     case PHASE_DO:
         if (s->buf_pos < s->buf_len) {
             s->csb |= CSB_REQ;
@@ -1165,7 +1318,10 @@ static void ncr5380_ack_release(NCR5380State *s)
              */
             s->csb = 0;
             s->phase = PHASE_DO;
-            s->bsr |= BSR_IRQ;
+            /* a genuine 5380 only interrupts on loss of BSY if asked to */
+            if (s->sun_mode || (s->mr & MR_MONITOR_BSY)) {
+                s->bsr |= BSR_IRQ;
+            }
             ncr5380_update_irq(s);
             if (s->req) {
                 scsi_req_unref(s->req);
@@ -1384,6 +1540,7 @@ static void ncr5380_realize(DeviceState *dev, Error **errp)
                           "ncr5380", 8 << s->reg_shift);
     sysbus_init_mmio(sbd, &s->mmio);
     sysbus_init_irq(sbd, &s->irq);
+    sysbus_init_irq(sbd, &s->drq);
 
     scsi_bus_init(&s->bus, sizeof(s->bus), dev, &ncr5380_scsi_info);
 }

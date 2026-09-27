@@ -22,6 +22,8 @@ struct NCR5380State {
 
     MemoryRegion mmio;
     qemu_irq irq;
+    qemu_irq drq;       /* DMA request output (sysbus IRQ 1): a board DMA
+                           engine moves bytes while this is asserted */
     SCSIBus bus;
     SCSIDevice *dev;
     SCSIRequest *req;
@@ -161,6 +163,12 @@ struct NCR5380State {
     int cmd_len;
     uint8_t status;
     uint8_t dma_mode;
+    /*
+     * Set at command-issue time when the initiator armed itself for a
+     * phase-change interrupt before launching (MR DMA_MODE set with TCR
+     * holding the impossible phase 4).  See ncr5380_do_command().
+     */
+    bool irq_on_data_phase;
     bool status_done;
     bool msg_done;
 
@@ -183,6 +191,15 @@ struct NCR5380State {
 bool ncr5380_pdma_ready(NCR5380State *s, bool out);
 uint8_t ncr5380_pdma_read(NCR5380State *s);
 void ncr5380_pdma_write(NCR5380State *s, uint8_t val);
+/*
+ * Genuine-5380 DMA handshake (non-sun boards, e.g. the Sun-3/60 "si"):
+ * direction the chip is armed for, -1 when DMA mode is off or no start
+ * register has been written, 0 = initiator receive (to memory), 1 = send.
+ * ncr5380_dma_eop() is the board's /EOP input: sets END_OF_DMA and, with
+ * MR ENABLE_EOP, interrupts.
+ */
+int ncr5380_dma_direction(NCR5380State *s);
+void ncr5380_dma_eop(NCR5380State *s);
 /* Sun si: move the bus to STATUS once the driver has finalised a data phase */
 void ncr5380_sun_to_status(NCR5380State *s);
 /*
