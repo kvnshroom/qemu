@@ -1,0 +1,263 @@
+# SunOS 4.1.1/sun3 installed system on QEMU -M sun3-60 -- boot, root login, commands, sync; reboot, login again
+# image: /tmp/sunos3-install/sun3-installed.img (built by sun3-tools/install/, 2026-09-27)
+# qemu-system-m68k -M sun3-60 -bios 3.60_v3.0.1_rom -display none -drive file=sun3-installed.img,format=raw,if=scsi,bus=0,unit=0 -serial ...
+# driver: sun3-tools/boot-sunos-installed.py; transcript has bit 7 stripped (getty even parity via the tty partab)
+Boot: sd(0,0,0) 
+root on sd0a fstype 4.2
+Boot: vmunix
+|Size: 893160/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/+189568+202104 bytes
+SunOS Release 4.1.1 (GENERIC) #1: Sat Oct 13 06:05:48 PDT 1990
+Copyright (c) 1983-1990, Sun Microsystems, Inc.
+mem = 16384K (0x1000000)
+avail mem = 15138816
+Ethernet address = 8:0:20:36:0:60
+si0 at obio 0x140000 pri 2 
+st0 at si0 slave 32
+st1 at si0 slave 40
+st2 at si0 slave 24
+st3 at si0 slave 16
+sr0 at si0 slave 48
+sd0 at si0 slave 0
+sd0:  <SunOS 4.1.1 sun3 target disk>
+sd1 at si0 slave 1
+sd2 at si0 slave 8
+sd3 at si0 slave 9
+sd4 at si0 slave 16
+sd6 at si0 slave 24
+zs0 at obio 0x20000 pri 3 
+zs1 at obio 0x0 pri 3 
+bwtwo0 at obmem 0xff000000 pri 4 
+bwtwo0: resolution 1152 x 900
+root on sd0a fstype 4.2
+swap on sd0b fstype spec size 16384K
+dump on sd0b fstype spec size 16360K
+checking filesystems
+/dev/rsd0a: 617 files, 2126 used, 28321 free 
+/dev/rsd0a: (33 frags, 3536 blocks, 0.1% fragmentation)
+/dev/rsd0g: 3041 files, 30828 used, 211075 free 
+/dev/rsd0g: (411 frags, 26333 blocks, 0.2% fragmentation)
+Automatic reboot in progress...
+Tue Sep 27 12:33:34 GMT 1994
+checking quotas: done.
+
+cat: /etc/defaultdomain: No such file or directory
+
+starting rpc and net services: portmap ypserv ypbind keyserv ypupdated routed.
+mount -vat nfs
+starting additional services: biod.
+starting system logger
+starting local daemons: auditd sendmail statd lockd.
+Sep 27 12:33:37  automount[89]: Can't get my address
+link-editor directory cache
+preserving editor files
+clearing /tmp
+standard daemons: update cron.
+starting network daemons: inetd printer.
+Tue Sep 27 12:33:37 GMT 1994
+
+Amnesiac login: 
+*** [12:33:40 +  20s] boot1: login: prompt; logging in as root
+root
+Sep 27 12:33:40  login: ROOT LOGIN console
+SunOS 4.1.1 sun3 target disk>
+# 
+*** [12:33:41 +  21s] boot1: root shell
+uname -a
+echo __DO''NE_boot1_0
+SunOS  4.1.1 1 sun3
+# __DONE_boot1_0
+# 
+*** [12:33:41 +  21s] boot1 cmd 1 (uname -a) done in 0s
+hostname
+echo __DO''NE_boot1_1
+
+# __DONE_boot1_1
+# 
+*** [12:33:41 +  21s] boot1 cmd 2 (hostname) done in 0s
+date
+echo __DO''NE_boot1_2
+Tue Sep 27 12:33:40 GMT 1994
+# __DONE_boot1_2
+# 
+*** [12:33:41 +  21s] boot1 cmd 3 (date) done in 0s
+df
+echo __DO''NE_boot1_3
+Filesystem            kbytes    used   avail capacity  Mounted on
+/dev/sd0a              30447    2130   25272     8%    /
+/dev/sd0g             241903   30828  186884    14%    /usr
+# __DONE_boot1_3
+# 
+*** [12:33:42 +  22s] boot1 cmd 4 (df) done in 0s
+mount
+echo __DO''NE_boot1_4
+/dev/sd0a on / type 4.2 (rw)
+/dev/sd0g on /usr type 4.2 (rw)
+# __DONE_boot1_4
+# 
+*** [12:33:42 +  22s] boot1 cmd 5 (mount) done in 0s
+ps -ax
+echo __DO''NE_boot1_5
+  PID TT STAT  TIME COMMAND
+    0 ?  D     0:00 swapper
+    1 ?  S     0:00 /sbin/init -
+    2 ?  D     0:00 pagedaemon
+   45 ?  S     0:00 portmap
+   48 ?  S     0:00 ypserv
+   50 ?  S     0:00 ypbind
+   52 ?  S     0:00 keyserv
+   55 ?  S     0:00 rpc.ypupdated
+   60 ?  S     0:00 in.routed
+   63 ?  S     0:00  (biod)
+   64 ?  S     0:00  (biod)
+   65 ?  S     0:00  (biod)
+   66 ?  S     0:00  (biod)
+   77 ?  S     0:00 syslogd
+   85 ?  S     0:00 /usr/lib/sendmail -bd -q1h
+   86 ?  Z     0:00 <defunct>
+   90 ?  S     0:00 rpc.statd
+   91 ?  S     0:00 rpc.lockd
+   97 ?  S     0:00 update
+  100 ?  S     0:00 cron
+  105 ?  S     0:00 inetd
+  108 ?  S     0:00 /usr/lib/lpd
+  110 co R     0:00 -csh (csh)
+  119 co R     0:00 ps -ax
+# __DONE_boot1_5
+# 
+*** [12:33:42 +  22s] boot1 cmd 6 (ps -ax) done in 0s
+who
+echo __DO''NE_boot1_6
+root     console Sep 27 12:33
+# __DONE_boot1_6
+# 
+*** [12:33:42 +  22s] boot1 cmd 7 (who) done in 0s
+echo 'main(){printf("hello from sunos on the sun3\n");}' > /tmp/h.c
+echo __DO''NE_boot1_7
+# __DONE_boot1_7
+# 
+*** [12:33:42 +  22s] boot1 cmd 8 (echo 'main(){printf("hello from sunos on) done in 0s
+cc -o /tmp/h /tmp/h.c
+echo __DO''NE_boot1_8
+# __DONE_boot1_8
+# 
+*** [12:33:43 +  23s] boot1 cmd 9 (cc -o /tmp/h /tmp/h.c) done in 0s
+/tmp/h
+echo __DO''NE_boot1_9
+hello from sunos on the sun3
+# __DONE_boot1_9
+# 
+*** [12:33:43 +  23s] boot1 cmd 10 (/tmp/h) done in 0s
+ls -l /vmunix /boot /sbin
+echo __DO''NE_boot1_10
+-r--r--r--  1 root       101800 Sep 27 12:14 /boot
+-rwxr-xr-x  1 root      1236025 Sep 27 12:13 /vmunix
+
+/sbin:
+total 408
+-rwxr-xr-x  1 root       122880 Sep 27 12:14 ifconfig
+-rwxr-xr-x  1 root        49152 Sep 27 12:14 init
+-rwxr-xr-x  1 root        24576 Sep 27 12:14 intr
+-rwxr-xr-x  1 root       131072 Sep 27 12:14 mount
+-rwxr-xr-x  1 root        73728 Sep 27 12:14 sh
+# __DONE_boot1_10
+# 
+*** [12:33:43 +  23s] boot1 cmd 11 (ls -l /vmunix /boot /sbin) done in 0s
+sync
+echo __DO''NE_boot1_11
+# __DONE_boot1_11
+# 
+*** [12:33:43 +  23s] boot1 cmd 12 (sync) done in 0s
+
+*** [12:33:43 +  23s] sync; reboot
+sync; reboot
+Sep 27 12:33:43  reboot: rebooted by root
+Sep 27 12:33:44  syslogd: going down on signal 15
+syncing file systems... done
+rebooting...
+Boot: sd(0,0,0) 
+root on sd0a fstype 4.2
+Boot: vmunix
+|Size: 893160/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/+189568+202104 bytes
+SunOS Release 4.1.1 (GENERIC) #1: Sat Oct 13 06:05:48 PDT 1990
+Copyright (c) 1983-1990, Sun Microsystems, Inc.
+mem = 16384K (0x1000000)
+avail mem = 15138816
+Ethernet address = 8:0:20:36:0:60
+si0 at obio 0x140000 pri 2 
+st0 at si0 slave 32
+st1 at si0 slave 40
+st2 at si0 slave 24
+st3 at si0 slave 16
+sr0 at si0 slave 48
+sd0 at si0 slave 0
+sd0:  <SunOS 4.1.1 sun3 target disk>
+sd1 at si0 slave 1
+sd2 at si0 slave 8
+sd3 at si0 slave 9
+sd4 at si0 slave 16
+sd6 at si0 slave 24
+zs0 at obio 0x20000 pri 3 
+zs1 at obio 0x0 pri 3 
+bwtwo0 at obmem 0xff000000 pri 4 
+bwtwo0: resolution 1152 x 900
+root on sd0a fstype 4.2
+swap on sd0b fstype spec size 16384K
+dump on sd0b fstype spec size 16360K
+checking filesystems
+/dev/rsd0a: 616 files, 2155 used, 28292 free 
+/dev/rsd0a: (44 frags, 3531 blocks, 0.1% fragmentation)
+/dev/rsd0g: 3041 files, 30828 used, 211075 free 
+/dev/rsd0g: (411 frags, 26333 blocks, 0.2% fragmentation)
+Automatic reboot in progress...
+Tue Sep 27 12:34:15 GMT 1994
+checking quotas: done.
+cat: /etc/defaultdomain: No such file or directory
+
+starting rpc and net services: portmap ypserv ypbind keyserv ypupdated routed.
+mount -vat nfs
+starting additional services: biod.
+starting system logger
+starting local daemons: auditd sendmail statd lockd.
+link-editor directory cache
+Sep 27 12:34:17  automount[89]: Can't get my address
+preserving editor files
+clearing /tmp
+standard daemons: update cron.
+starting network daemons: inetd printer.
+Tue Sep 27 12:34:18 GMT 1994
+
+Amnesiac login: 
+*** [12:34:21 +  61s] boot2: login: prompt; logging in as root
+root
+Sep 27 12:34:21  login: ROOT LOGIN console
+Last login: Tue Sep 27 12:33:40 on console
+SunOS 4.1.1 sun3 target disk>
+# 
+*** [12:34:21 +  61s] boot2: root shell
+uname -a
+echo __DO''NE_boot2_0
+SunOS  4.1.1 1 sun3
+# __DONE_boot2_0
+# 
+*** [12:34:21 +  61s] boot2 cmd 1 (uname -a) done in 0s
+uptime
+echo __DO''NE_boot2_1
+ 12:34pm  up  1 user,  load average: 0.13, 0.03, 0.00
+# __DONE_boot2_1
+# 
+*** [12:34:22 +  62s] boot2 cmd 2 (uptime) done in 0s
+df
+echo __DO''NE_boot2_2
+Filesystem            kbytes    used   avail capacity  Mounted on
+/dev/sd0a              30447    2132   25270     8%    /
+/dev/sd0g             241903   30828  186884    14%    /usr
+# __DONE_boot2_2
+# 
+*** [12:34:22 +  62s] boot2 cmd 3 (df) done in 0s
+sync
+echo __DO''NE_boot2_3
+# __DONE_boot2_3
+# 
+*** [12:34:22 +  62s] boot2 cmd 4 (sync) done in 0s
+
+*** [12:34:22 +  62s] ALL OK

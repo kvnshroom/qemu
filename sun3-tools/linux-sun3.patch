@@ -1,0 +1,247 @@
+diff --git a/arch/m68k/include/asm/elf.h b/arch/m68k/include/asm/elf.h
+index 2def06a99b08..2742bb325326 100644
+--- a/arch/m68k/include/asm/elf.h
++++ b/arch/m68k/include/asm/elf.h
+@@ -81,7 +81,14 @@ typedef struct user_m68kfp_struct elf_fpregset_t;
+ #ifndef CONFIG_SUN3
+ #define ELF_ET_DYN_BASE         0xD0000000UL
+ #else
+-#define ELF_ET_DYN_BASE         0x0D800000UL
++/*
++ * The Sun-3 kernel lives at 0x0E000000, so all of user space is only
++ * ~224MB.  A dyn-base up near the top (the old 0x0D800000) left no room
++ * for a PIE executable, its interpreter, the stack and the brk without
++ * colliding ("elf segment ... requested but the memory is mapped
++ * already").  Put it around 1/4 of the user address space instead.
++ */
++#define ELF_ET_DYN_BASE         0x04000000UL
+ #endif
+ 
+ #define ELF_CORE_COPY_REGS(pr_reg, regs)				\
+diff --git a/arch/m68k/include/asm/sun3_pgtable.h b/arch/m68k/include/asm/sun3_pgtable.h
+index 80ca185a18a1..ff4334081e84 100644
+--- a/arch/m68k/include/asm/sun3_pgtable.h
++++ b/arch/m68k/include/asm/sun3_pgtable.h
+@@ -34,6 +34,13 @@
+ #define SUN3_PAGE_ACCESSED  (0x02000000)
+ #define SUN3_PAGE_MODIFIED  (0x01000000)
+ 
++/*
++ * Software-only PTE bit for pte_special().  Bits 19..23 (0x00f80000) sit
++ * above the hardware page-frame field (SUN3_PAGE_PGNUM_MASK, bits 0..18)
++ * and below the hardware flag bits, so the Sun-3 MMU ignores them.
++ */
++#define SUN3_PAGE_SPECIAL   (0x00080000)
++
+ 
+ /* Externally used page protection values. */
+ #define _PAGE_PRESENT	(SUN3_PAGE_VALID)
+@@ -134,6 +141,7 @@ static inline void pmd_clear (pmd_t *pmdp) { pmd_val (*pmdp) = 0; }
+ static inline int pte_write(pte_t pte)		{ return pte_val(pte) & SUN3_PAGE_WRITEABLE; }
+ static inline int pte_dirty(pte_t pte)		{ return pte_val(pte) & SUN3_PAGE_MODIFIED; }
+ static inline int pte_young(pte_t pte)		{ return pte_val(pte) & SUN3_PAGE_ACCESSED; }
++static inline int pte_special(pte_t pte)	{ return pte_val(pte) & SUN3_PAGE_SPECIAL; }
+ 
+ static inline pte_t pte_wrprotect(pte_t pte)	{ pte_val(pte) &= ~SUN3_PAGE_WRITEABLE; return pte; }
+ static inline pte_t pte_mkclean(pte_t pte)	{ pte_val(pte) &= ~SUN3_PAGE_MODIFIED; return pte; }
+@@ -141,6 +149,7 @@ static inline pte_t pte_mkold(pte_t pte)	{ pte_val(pte) &= ~SUN3_PAGE_ACCESSED;
+ static inline pte_t pte_mkwrite_novma(pte_t pte){ pte_val(pte) |= SUN3_PAGE_WRITEABLE; return pte; }
+ static inline pte_t pte_mkdirty(pte_t pte)	{ pte_val(pte) |= SUN3_PAGE_MODIFIED; return pte; }
+ static inline pte_t pte_mkyoung(pte_t pte)	{ pte_val(pte) |= SUN3_PAGE_ACCESSED; return pte; }
++static inline pte_t pte_mkspecial(pte_t pte)	{ pte_val(pte) |= SUN3_PAGE_SPECIAL; return pte; }
+ static inline pte_t pte_mknocache(pte_t pte)	{ pte_val(pte) |= SUN3_PAGE_NOCACHE; return pte; }
+ // use this version when caches work...
+ //static inline pte_t pte_mkcache(pte_t pte)	{ pte_val(pte) &= SUN3_PAGE_NOCACHE; return pte; }
+diff --git a/arch/m68k/sun3/config.c b/arch/m68k/sun3/config.c
+index cd8af809e0ca..98f608f00ed7 100644
+--- a/arch/m68k/sun3/config.c
++++ b/arch/m68k/sun3/config.c
+@@ -118,14 +118,66 @@ static void __init sun3_bootmem_alloc(unsigned long memory_start,
+ 	high_memory = (void *)memory_end;
+ 	availmem = memory_start;
+ 
++	/*
++	 * memblock_free_all() clamps the pages it releases into the buddy
++	 * allocator to [min_low_pfn, max_low_pfn); without these set the
++	 * whole of RAM stays reserved and the first slab allocation fails.
++	 */
++	min_low_pfn = __pa(memory_start) >> PAGE_SHIFT;
++	max_low_pfn = max_pfn;
++
++	/*
++	 * Register physical RAM with memblock and reserve the kernel image
++	 * (and the embedded initramfs) below memory_start.  The generic
++	 * m68k_setup_node() no longer does this, and sun3's paging_init()
++	 * allocates its page tables straight out of memblock, so without
++	 * this memblock is empty and paging_init() panics.
++	 */
++	memblock_add(0, __pa(memory_end));
++	memblock_reserve(0, __pa(memory_start));
++	/*
++	 * paging_init() runs while only the low RAM the PROM handed us is
++	 * mapped, so its page-table allocations must come from just above
++	 * the kernel (bottom-up) rather than the unmapped top of RAM.
++	 */
++	memblock_set_bottom_up(true);
++
+ 	m68k_setup_node(0);
+ }
+ 
+ 
++/*
++ * Early boot console over the resident PROM's polled character output.
++ * Registered as a CON_BOOT console so it is handed over to the real
++ * hvc0 console (hvc_sun3) once that comes up.  Lets us see the very
++ * early MMU/setup path.
++ */
++static void sun3_early_console_write(struct console *con, const char *s,
++				     unsigned int n)
++{
++	while (n-- > 0) {
++		if (*s == '\n')
++			prom_putchar('\r');
++		prom_putchar(*s++);
++	}
++}
++
++static struct console sun3_early_console = {
++	.name  = "sun3prom",
++	.write = sun3_early_console_write,
++	.flags = CON_PRINTBUFFER | CON_BOOT,
++	.index = -1,
++};
++
+ void __init config_sun3(void)
+ {
+ 	unsigned long memory_start, memory_end;
+ 
++	if (!sun3_early_console.data) {
++		sun3_early_console.data = &sun3_early_console;
++		register_console(&sun3_early_console);
++	}
++
+ 	pr_info("ARCH: SUN3\n");
+ 	idprom_init();
+ 
+diff --git a/drivers/tty/hvc/Kconfig b/drivers/tty/hvc/Kconfig
+index 5866195de26a..ff2b00ff8239 100644
+--- a/drivers/tty/hvc/Kconfig
++++ b/drivers/tty/hvc/Kconfig
+@@ -106,6 +106,16 @@ config HVC_DCC_SERIALIZE_SMP
+ 	  CPU hotplug to work. For example, during early chipset bringups without
+ 	  debug serial console support. If unsure, say N.
+ 
++config HVC_SUN3
++	bool "Sun-3 PROM console support"
++	depends on SUN3
++	select HVC_DRIVER
++	default y
++	help
++	  This enables a polled console and interactive tty (/dev/hvc0)
++	  built on the resident Sun-3 boot PROM's character I/O routines.
++	  It is the standard serial console for the Sun-3 under QEMU.
++
+ config HVC_RISCV_SBI
+ 	bool "RISC-V SBI console support"
+ 	depends on RISCV_SBI && NONPORTABLE
+diff --git a/drivers/tty/hvc/Makefile b/drivers/tty/hvc/Makefile
+index 98880e357941..81bdce831561 100644
+--- a/drivers/tty/hvc/Makefile
++++ b/drivers/tty/hvc/Makefile
+@@ -9,5 +9,6 @@ obj-$(CONFIG_HVC_IRQ)		+= hvc_irq.o
+ obj-$(CONFIG_HVC_XEN)		+= hvc_xen.o
+ obj-$(CONFIG_HVC_IUCV)		+= hvc_iucv.o
+ obj-$(CONFIG_HVC_UDBG)		+= hvc_udbg.o
++obj-$(CONFIG_HVC_SUN3)		+= hvc_sun3.o
+ obj-$(CONFIG_HVC_RISCV_SBI)	+= hvc_riscv_sbi.o
+ obj-$(CONFIG_HVCS)		+= hvcs.o
+=== NEW FILE drivers/tty/hvc/hvc_sun3.c ===
+diff --git a/drivers/tty/hvc/hvc_sun3.c b/drivers/tty/hvc/hvc_sun3.c
+new file mode 100644
+index 000000000000..f68c79922c84
+--- /dev/null
++++ b/drivers/tty/hvc/hvc_sun3.c
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Sun-3 PROM console for hvc_console.
++ *
++ * The Sun-3 boot PROM stays resident and mapped (romvec at
++ * LINUX_OPPROM_BEGVM) after the kernel takes over, so its polled
++ * character I/O routines can be used as a simple, interrupt-free
++ * console and interactive tty.  Modelled on hvc_udbg.c.
++ */
++
++#include <linux/console.h>
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/types.h>
++
++#include <asm/oplib.h>
++#include <asm/setup.h>
++
++#include "hvc_console.h"
++
++static struct hvc_struct *hvc_sun3_dev;
++
++static ssize_t hvc_sun3_put(uint32_t vtermno, const u8 *buf, size_t count)
++{
++	size_t i;
++
++	for (i = 0; i < count; i++) {
++		if (buf[i] == '\n')
++			prom_putchar('\r');
++		prom_putchar(buf[i]);
++	}
++
++	return i;
++}
++
++static ssize_t hvc_sun3_get(uint32_t vtermno, u8 *buf, size_t count)
++{
++	size_t i;
++	int c;
++
++	for (i = 0; i < count; i++) {
++		c = prom_nbgetchar();
++		if (c == -1)
++			break;
++		buf[i] = c;
++	}
++
++	return i;
++}
++
++static const struct hv_ops hvc_sun3_ops = {
++	.get_chars = hvc_sun3_get,
++	.put_chars = hvc_sun3_put,
++};
++
++static int __init hvc_sun3_init(void)
++{
++	struct hvc_struct *hp;
++
++	if (!MACH_IS_SUN3)
++		return -ENODEV;
++
++	hp = hvc_alloc(0, 0, &hvc_sun3_ops, 16);
++	if (IS_ERR(hp))
++		return PTR_ERR(hp);
++
++	hvc_sun3_dev = hp;
++
++	return 0;
++}
++device_initcall(hvc_sun3_init);
++
++static int __init hvc_sun3_console_init(void)
++{
++	if (!MACH_IS_SUN3)
++		return -ENODEV;
++
++	hvc_instantiate(0, 0, &hvc_sun3_ops);
++	add_preferred_console("hvc", 0, NULL);
++
++	return 0;
++}
++console_initcall(hvc_sun3_console_init);

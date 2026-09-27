@@ -1,0 +1,54 @@
+EEPROM: Using RS232 A port.
+Selftest Completed.
+Sun Workstation, Model Sun-3/60C/G.
+Type-4 Keyboard.
+ROM Rev 3.0.1, 16MB memory installed, Serial #0.
+Ethernet address 8:0:20:36:0:60, Host ID 17000000.
+Testing 0 Megabytes of Memory ... Completed.
+Auto-boot in progress...
+Boot: sd(0,0,0) 
+>> NetBSD ufsboot [$Revision: 1.7 $]
+ufsboot: trying netbsd
+|/-ufsboot: trying netbsd.old
+\|/ufsboot: trying netbsd.sun3
+-\|/ufsboot: loading netbsd.sun3
+-768996\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|+35400/-\|/+155036+[57288-\|/-\|+64857]/-\|/-\|=0x1080ed
+Starting program at 0x4000
+console is ttya
+Copyright (c) 1996, 1997, 1998, 1999, 2000, 2001
+    The NetBSD Foundation, Inc.  All rights reserved.
+Copyright (c) 1982, 1986, 1989, 1991, 1993
+    The Regents of the University of California.  All rights reserved.
+NetBSD 1.5.2 (INSTALL) #8: Sat Sep  8 18:23:26 CEST 2001
+    he@gjok.urc.uninett.no:/usr/src/sys/arch/sun3/compile/INSTALL
+Model: sun3 60
+fpu: mc68881
+total memory = 16384 KB
+avail memory = 14192 KB
+using 115 buffers containing 920 KB of memory
+mainbus0 (root)
+obio0 at mainbus0
+zsc0 at obio0 addr 0x0 ipl 6: (softpri 3)
+kbd0 at zsc0 channel 0
+zsc0:  channel 1 not configured
+zsc1 at obio0 addr 0x20000 ipl 6: (softpri 3)
+zstty0 at zsc1 channel 0 (console i/o)
+zstty1 at zsc1 channel 1
+eeprom0 at obio0 addr 0x40000
+clock0 at obio0 addr 0x60000 ipl 5
+memerr0 at obio0 addr 0x80000 ipl 7: (Parity memory)
+intreg0 at obio0 addr 0xa0000
+le0 at obio0 addr 0x120000 ipl 3: address 08:00:20:36:00:60
+le0: 8 receive buffers, 2 transmit buffers
+si0 at obio0 addr 0x140000 ipl 2: options=0xf
+scsibus0 at si0: 8 targets, 8 luns per target
+enabling interrupts
+scsibus0: waiting 2 seconds for devices to settle...
+sd0 at scsibus0 target 0 lun 0: <QEMU, QEMU HARDDISK, 2.5+> SCSI5 0/direct fixed
+sd0: 12288 KB, 24 cyl, 16 head, 64 sec, 512 bytes/sect x 24576 sectors
+boot device: sd0a
+root on sd0a dumps on sd0b
+WARNING: clock lost 2538 days -- CHECK AND RESET THE DATE!
+root file system type: ffs
+/etc/rc: Can't open /etc/rc
+Enter pathname of shell or RETURN for sh: 

@@ -1,0 +1,16 @@
+CMDS = [
+    'fsck -y /dev/rsd0a; fsck -y /dev/rsd0g',
+    'mount /dev/sd0a /a; mount /dev/sd0g /a/usr',
+    'cd /a/usr ; zcat < /dev/rsd2b | tar xfBp - ; echo USR_tar_status=$?',
+    'sync ; sync',
+    'mkdir -p /a/usr/kvm ; cd /a/usr/kvm ; zcat < /dev/rsd2d | tar xfBp - ; echo KVM_tar_status=$?',
+    'sync ; sync',
+    'cd /a/usr ; zcat < /dev/rsd2e | tar xfBp - ; echo INSTALL_tar_status=$?',
+    'cd /a/usr ; zcat < /dev/rsd2f | tar xfBp - ; echo NET_tar_status=$?',
+    'sync ; sync',
+    'ls /a/usr | sed 40q',
+    'ls -l /a/usr/kvm/stand /a/usr/kvm/boot /a/usr/kvm/mdec',
+    'cp /a/usr/kvm/stand/vmunix /a/vmunix; ls -l /a/vmunix /a/usr/kvm/stand/vmunix',
+    'sync ; sync',
+    'cd / ; umount /a/usr; umount /a; fsck -y /dev/rsd0a; fsck -y /dev/rsd0g; sync; sync',
+]

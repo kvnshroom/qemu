@@ -1,0 +1,335 @@
+### session 39: SunOS 4.1.1/sun3 on -M sun3-60 with -nic user,id=n0,model=lance,guestfwd=tcp:10.0.2.100:7-cmd:<one-shot echo>
+### run A: fresh copy of sun3-installed-gfx.img -- configure le0 by hand, ping/telnet, persist, halt
+Boot: sd(0,0,0) 
+root on sd0a fstype 4.2
+Boot: vmunix
+|Size: 893160/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/+189568+202104 bytes
+SunOS Release 4.1.1 (GENERIC) #1: Sat Oct 13 06:05:48 PDT 1990
+Copyright (c) 1983-1990, Sun Microsystems, Inc.
+mem = 16384K (0x1000000)
+avail mem = 15138816
+Ethernet address = 8:0:20:36:0:60
+si0 at obio 0x140000 pri 2 
+st0 at si0 slave 32
+st1 at si0 slave 40
+st2 at si0 slave 24
+st3 at si0 slave 16
+sr0 at si0 slave 48
+sd0 at si0 slave 0
+sd0:  <SunOS 4.1.1 sun3 target disk>
+sd1 at si0 slave 1
+sd2 at si0 slave 8
+sd3 at si0 slave 9
+sd4 at si0 slave 16
+sd6 at si0 slave 24
+zs0 at obio 0x20000 pri 3 
+zs1 at obio 0x0 pri 3 
+le0 at obio 0x120000 pri 3 
+bwtwo0 at obmem 0xff000000 pri 4 
+bwtwo0: resolution 1152 x 900
+root on sd0a fstype 4.2
+swap on sd0b fstype spec size 16384K
+dump on sd0b fstype spec size 16360K
+checking filesystems
+/dev/rsd0a: 649 files, 2132 used, 28315 free 
+/dev/rsd0a: (43 frags, 3534 blocks, 0.1% fragmentation)
+/dev/rsd0g: 5972 files, 68376 used, 173527 free 
+/dev/rsd0g: (1487 frags, 21505 blocks, 0.6% fragmentation)
+Automatic reboot in progress...
+Tue Sep 27 22:23:31 GMT 1994
+checking quotas: done.
+cat: /etc/defaultdomain: No such file or directory
+starting rpc and net services: portmap ypserv ypbind keyserv ypupdated routed.
+mount -vat nfs
+starting additional services: biod.
+starting system logger
+starting local daemons: auditd sendmail statd lockd.
+link-editor directory cache
+Sep 27 22:23:33  automount[91]: Can't get my address
+preserving editor files
+clearing /tmp
+standard daemons: update cron.
+starting network daemons: inetd printer.
+Tue Sep 27 22:23:33 GMT 1994
+Amnesiac login: 
+*** [22:23:36 +  19s] boot1: login: prompt; logging in as root
+root
+Sep 27 22:23:36  login: ROOT LOGIN console
+Last login: Tue Sep 27 12:56:42 on console
+SunOS 4.1.1 sun3 target disk>
+# 
+*** [22:23:37 +  19s] boot1: root shell
+dmesg | grep le0
+echo __DO''NE_boot1_0
+le0 at obio 0x120000 pri 3 
+# __DONE_boot1_0
+# 
+*** [22:23:37 +  20s] boot1 cmd 1 (dmesg | grep le0) done in 0s
+cat /etc/hosts
+echo __DO''NE_boot1_1
+#
+# Sun Host Database
+#
+# If the NIS is running, this file is only consulted when booting
+#
+127.0.0.1	localhost loghost
+#
+127.0.0.1 localhost
+192.168.1.3 sun3
+192.168.1.3 sun3-60
+# __DONE_boot1_1
+# 
+*** [22:23:37 +  20s] boot1 cmd 2 (cat /etc/hosts) done in 0s
+hostname sun3-60; hostname
+echo __DO''NE_boot1_2
+sun3-60
+# __DONE_boot1_2
+# 
+*** [22:23:37 +  20s] boot1 cmd 3 (hostname sun3-60; hostname) done in 0s
+ifconfig le0 10.0.2.15 netmask 255.255.255.0 up
+echo __DO''NE_boot1_3
+# __DONE_boot1_3
+# 
+*** [22:23:37 +  20s] boot1 cmd 4 (ifconfig le0 10.0.2.15 netmask 255.255.2) done in 0s
+ifconfig -a
+echo __DO''NE_boot1_4
+le0: flags=43<UP,BROADCAST,RUNNING>
+	inet 10.0.2.15 netmask ffffff00 broadcast 10.0.2.0
+	ether 8:0:20:36:0:60 
+lo0: flags=49<UP,LOOPBACK,RUNNING>
+	inet 127.0.0.1 netmask ff000000 
+# __DONE_boot1_4
+# 
+*** [22:23:38 +  20s] boot1 cmd 5 (ifconfig -a) done in 0s
+route add default 10.0.2.2 1
+echo __DO''NE_boot1_5
+add net default: gateway 10.0.2.2
+# __DONE_boot1_5
+# 
+*** [22:23:38 +  21s] boot1 cmd 6 (route add default 10.0.2.2 1) done in 0s
+ping 10.0.2.2 10
+echo __DO''NE_boot1_6
+10.0.2.2 is alive
+# __DONE_boot1_6
+# 
+*** [22:23:38 +  21s] boot1 cmd 7 (ping 10.0.2.2 10) done in 0s
+ping -s 10.0.2.2 56 3
+echo __DO''NE_boot1_7
+PING 10.0.2.2: 56 data bytes
+64 bytes from 10.0.2.2: icmp_seq=0. time=0. ms
+64 bytes from 10.0.2.2: icmp_seq=1. time=0. ms
+64 bytes from 10.0.2.2: icmp_seq=2. time=0. ms
+----10.0.2.2 PING Statistics----
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip (ms)  min/avg/max = 0/0/0
+# __DONE_boot1_7
+# 
+*** [22:23:40 +  23s] boot1 cmd 8 (ping -s 10.0.2.2 56 3) done in 2s
+ping 10.0.2.3 5
+echo __DO''NE_boot1_8
+10.0.2.3 is alive
+# __DONE_boot1_8
+# 
+*** [22:23:40 +  23s] boot1 cmd 9 (ping 10.0.2.3 5) done in 0s
+netstat -in
+echo __DO''NE_boot1_9
+Name  Mtu  Net/Dest      Address        Ipkts  Ierrs Opkts  Oerrs Collis Queue 
+le0   1500 10.0.2.0      10.0.2.15      7       0    8       0    0      0     
+lo0   1536 127.0.0.0     127.0.0.1      96      0    96      0    0      0     
+# __DONE_boot1_9
+# 
+*** [22:23:41 +  23s] boot1 cmd 10 (netstat -in) done in 0s
+netstat -rn
+echo __DO''NE_boot1_10
+Routing tables
+Destination          Gateway              Flags    Refcnt Use        Interface
+127.0.0.1            127.0.0.1            UH       1      62         lo0
+default              10.0.2.2             UG       0      0          le0
+10.0.2.0             10.0.2.15            U        0      5          le0
+# __DONE_boot1_10
+# 
+*** [22:23:41 +  24s] boot1 cmd 11 (netstat -rn) done in 0s
+arp -a
+echo __DO''NE_boot1_11
+? (10.0.2.2) at 52:55:a:0:2:2
+? (10.0.2.3) at 52:55:a:0:2:3
+# __DONE_boot1_11
+# 
+*** [22:23:41 +  24s] boot1 cmd 12 (arp -a) done in 0s
+echo hello-from-sun3 | telnet 10.0.2.100 7
+echo __DO''NE_boot1_12
+Trying 10.0.2.100 ...
+Connected to 10.0.2.100.
+Escape character is '^]'.
+Connection closed by foreign host.
+# __DONE_boot1_12
+# 
+*** [22:23:41 +  24s] boot1 cmd 13 (echo hello-from-sun3 | telnet 10.0.2.100) done in 0s
+echo sun3-60 > /etc/hostname.le0; cat /etc/hostname.le0
+echo __DO''NE_boot1_13
+sun3-60
+# __DONE_boot1_13
+# 
+*** [22:23:41 +  24s] boot1 cmd 14 (echo sun3-60 > /etc/hostname.le0; cat /e) done in 0s
+grep -v sun3-60 /etc/hosts > /tmp/hosts.new; echo '10.0.2.15 sun3-60 loghost' >> /tmp/hosts.new; cat /tmp/hosts.new > /etc/hosts; cat /etc/hosts
+echo __DO''NE_boot1_14
+#
+# Sun Host Database
+#
+# If the NIS is running, this file is only consulted when booting
+#
+127.0.0.1	localhost loghost
+#
+127.0.0.1 localhost
+192.168.1.3 sun3
+10.0.2.15 sun3-60 loghost
+# __DONE_boot1_14
+# 
+*** [22:23:42 +  24s] boot1 cmd 15 (grep -v sun3-60 /etc/hosts > /tmp/hosts.) done in 0s
+echo 10.0.2.2 > /etc/defaultrouter; cat /etc/defaultrouter
+echo __DO''NE_boot1_15
+10.0.2.2
+# __DONE_boot1_15
+# 
+*** [22:23:42 +  25s] boot1 cmd 16 (echo 10.0.2.2 > /etc/defaultrouter; cat ) done in 0s
+sync
+echo __DO''NE_boot1_16
+# __DONE_boot1_16
+# 
+*** [22:23:42 +  25s] boot1 cmd 17 (sync) done in 0s
+*** [22:23:42 +  25s] sync; sync; halt
+sync; sync; halt
+Sep 27 22:23:41  halt: halted by root
+Sep 27 22:23:42  syslogd: going down on signal 15
+syncing file systems... 4 1 1 1 1 1 done
+Halted
+>
+*** [22:25:42 + 145s] no "syncing file systems... done" from the kernel
+
+### run D: same image after the fixes (/sbin/hostname, /etc/netmasks, rc.local defaultrouter) -- unattended boot
+Boot: sd(0,0,0) 
+root on sd0a fstype 4.2
+Boot: vmunix
+|Size: 893160/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/-\|/+189568+202104 bytes
+SunOS Release 4.1.1 (GENERIC) #1: Sat Oct 13 06:05:48 PDT 1990
+Copyright (c) 1983-1990, Sun Microsystems, Inc.
+mem = 16384K (0x1000000)
+avail mem = 15138816
+Ethernet address = 8:0:20:36:0:60
+si0 at obio 0x140000 pri 2 
+st0 at si0 slave 32
+st1 at si0 slave 40
+st2 at si0 slave 24
+st3 at si0 slave 16
+sr0 at si0 slave 48
+sd0 at si0 slave 0
+sd0:  <SunOS 4.1.1 sun3 target disk>
+sd1 at si0 slave 1
+sd2 at si0 slave 8
+sd3 at si0 slave 9
+sd4 at si0 slave 16
+sd6 at si0 slave 24
+zs0 at obio 0x20000 pri 3 
+zs1 at obio 0x0 pri 3 
+le0 at obio 0x120000 pri 3 
+bwtwo0 at obmem 0xff000000 pri 4 
+bwtwo0: resolution 1152 x 900
+root on sd0a fstype 4.2
+swap on sd0b fstype spec size 16384K
+dump on sd0b fstype spec size 16360K
+Setting netmask of le0 to 255.255.255.0
+checking filesystems
+/dev/rsd0a: 652 files, 2175 used, 28272 free 
+/dev/rsd0a: (48 frags, 3528 blocks, 0.2% fragmentation)
+/dev/rsd0g: 5972 files, 68376 used, 173527 free 
+/dev/rsd0g: (1487 frags, 21505 blocks, 0.6% fragmentation)
+Automatic reboot in progress...
+Tue Sep 27 22:50:16 GMT 1994
+checking quotas: done.
+cat: /etc/defaultdomain: No such file or directory
+starting rpc and net services: portmap ypserv ypbind keyserv ypupdated routed.
+mount -vat nfs
+starting additional services: biod.
+starting system logger
+starting local daemons: auditd sendmail statd lockd.
+link-editor directory cache
+add net default: gateway 10.0.2.2
+preserving editor files
+clearing /tmp
+standard daemons: update cron.
+starting network daemons: inetd printer.
+Tue Sep 27 22:50:18 GMT 1994
+sun3-60 login: 
+*** [22:50:21 +  24s] boot1: login: prompt; logging in as root
+root
+Sep 27 22:50:21 sun3-60 login: ROOT LOGIN console
+Last login: Tue Sep 27 22:46:44 on console
+SunOS 4.1.1 sun3 target disk>
+sun3-60# 
+*** [22:50:22 +  25s] boot1: root shell
+hostname
+echo __DO''NE_boot1_0
+sun3-60
+sun3-60# __DONE_boot1_0
+sun3-60# 
+*** [22:50:22 +  25s] boot1 cmd 1 (hostname) done in 0s
+ifconfig -a
+echo __DO''NE_boot1_1
+le0: flags=63<UP,BROADCAST,NOTRAILERS,RUNNING>
+	inet 10.0.2.15 netmask ffffff00 broadcast 10.0.2.0
+	ether 8:0:20:36:0:60 
+lo0: flags=49<UP,LOOPBACK,RUNNING>
+	inet 127.0.0.1 netmask ff000000 
+sun3-60# __DONE_boot1_1
+sun3-60# 
+*** [22:50:22 +  25s] boot1 cmd 2 (ifconfig -a) done in 0s
+netstat -rn
+echo __DO''NE_boot1_2
+Routing tables
+Destination          Gateway              Flags    Refcnt Use        Interface
+127.0.0.1            127.0.0.1            UH       0      0          lo0
+default              10.0.2.2             UG       0      0          le0
+10.0.2.0             10.0.2.15            U        3      70         le0
+sun3-60# __DONE_boot1_2
+sun3-60# 
+*** [22:50:22 +  25s] boot1 cmd 3 (netstat -rn) done in 0s
+netstat -in
+echo __DO''NE_boot1_3
+Name  Mtu  Net/Dest      Address        Ipkts  Ierrs Opkts  Oerrs Collis Queue 
+le0   1500 10.0.2.0      10.0.2.15      2       0    4       0    0      0     
+lo0   1536 127.0.0.0     127.0.0.1      104     0    104     0    0      0     
+sun3-60# __DONE_boot1_3
+sun3-60# 
+*** [22:50:22 +  25s] boot1 cmd 4 (netstat -in) done in 0s
+ping 10.0.2.2 5
+echo __DO''NE_boot1_4
+10.0.2.2 is alive
+sun3-60# __DONE_boot1_4
+sun3-60# 
+*** [22:50:23 +  26s] boot1 cmd 5 (ping 10.0.2.2 5) done in 0s
+ping 10.0.2.3 5
+echo __DO''NE_boot1_5
+10.0.2.3 is alive
+sun3-60# __DONE_boot1_5
+sun3-60# 
+*** [22:50:23 +  26s] boot1 cmd 6 (ping 10.0.2.3 5) done in 0s
+arp -a
+echo __DO''NE_boot1_6
+? (10.0.2.2) at 52:55:a:0:2:2
+? (10.0.2.3) at 52:55:a:0:2:3
+sun3-60# __DONE_boot1_6
+sun3-60# 
+*** [22:50:23 +  26s] boot1 cmd 7 (arp -a) done in 0s
+sync
+echo __DO''NE_boot1_7
+sun3-60# __DONE_boot1_7
+sun3-60# 
+*** [22:50:23 +  26s] boot1 cmd 8 (sync) done in 0s
+*** [22:50:23 +  26s] sync; sync; halt
+sync; sync; halt
+Sep 27 22:50:23 sun3-60 halt: halted by root
+Sep 27 22:50:24 sun3-60 syslogd: going down on signal 15
+syncing file systems... done
+Halted
+>
+*** [22:50:39 +  42s] ALL OK
