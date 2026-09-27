@@ -6,6 +6,7 @@
 #include "hw/core/sysbus.h"
 #include "ui/input.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 /* escc.c */
 #define TYPE_ESCC "escc"
@@ -49,6 +50,10 @@ typedef struct ESCCChannelState {
     bool dcd;
     QemuInputHandlerState *hs;
     char *sunkbd_layout;
+    /* keyboard replies are delayed by the 1200 baud command time */
+    QEMUTimer sunkbd_reply_timer;
+    uint8_t sunkbd_reply[4];
+    uint32_t sunkbd_reply_len;
     int sunmouse_dx;
     int sunmouse_dy;
     int sunmouse_buttons;

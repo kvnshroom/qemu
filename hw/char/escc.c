@@ -966,6 +966,27 @@ static void serial_event(void *opaque, QEMUChrEvent event)
     }
 }
 
+static bool escc_chn_sunkbd_reply_needed(void *opaque)
+{
+    ESCCChannelState *s = opaque;
+
+    return s->sunkbd_reply_len != 0;
+}
+
+/* a keyboard reply still in flight (see SUNKBD_REPLY_DELAY_NS) */
+static const VMStateDescription vmstate_escc_chn_sunkbd_reply = {
+    .name = "escc_chn/sunkbd_reply",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = escc_chn_sunkbd_reply_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER(sunkbd_reply_timer, ESCCChannelState),
+        VMSTATE_UINT32(sunkbd_reply_len, ESCCChannelState),
+        VMSTATE_UINT8_ARRAY(sunkbd_reply, ESCCChannelState, 4),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_escc_chn = {
     .name = "escc_chn",
     .version_id = 2,
@@ -982,6 +1003,10 @@ static const VMStateDescription vmstate_escc_chn = {
         VMSTATE_BUFFER(wregs, ESCCChannelState),
         VMSTATE_BUFFER(rregs, ESCCChannelState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_escc_chn_sunkbd_reply,
+        NULL
     }
 };
 
@@ -1126,6 +1151,42 @@ static uint8_t sunkbd_layout_dip_switch(const char *kbd_layout)
     return ret;
 }
 
+/*
+ * A Sun keyboard cannot answer before the command has been shifted out
+ * to it: at 1200 baud the command byte alone takes 8.3 ms, and the reply
+ * then comes back at the same rate.  NetBSD's sun kbd_iopen() depends on
+ * that order -- it drains its transmitter (sleeping for the Tx
+ * interrupt) *before* it sleeps for the reset reply, so a reply queued
+ * synchronously inside the command write woke nobody and every open
+ * logged "kbd0: reset failed" and fell back to the Type-3 layout (seen
+ * on sun3-60 with NetBSD 1.5.2).  10 ms covers the command byte and the
+ * keyboard's turnaround; the PROMs poll for the reply with timeouts of
+ * seconds and SunOS's kbd driver uses callout timers, so they are
+ * indifferent to the delay.
+ */
+#define SUNKBD_REPLY_DELAY_NS   (10 * SCALE_MS)
+
+static void sunkbd_reply_cb(void *opaque)
+{
+    ESCCChannelState *s = opaque;
+    unsigned i;
+
+    for (i = 0; i < s->sunkbd_reply_len; i++) {
+        put_queue(s, s->sunkbd_reply[i]);
+    }
+    s->sunkbd_reply_len = 0;
+}
+
+static void sunkbd_reply(ESCCChannelState *s, const uint8_t *bytes,
+                         unsigned len)
+{
+    clear_queue(s);
+    memcpy(s->sunkbd_reply, bytes, len);
+    s->sunkbd_reply_len = len;
+    timer_mod(&s->sunkbd_reply_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SUNKBD_REPLY_DELAY_NS);
+}
+
 static void handle_kbd_command(ESCCChannelState *s, int val)
 {
     trace_escc_kbd_command(val);
@@ -1135,19 +1196,16 @@ static void handle_kbd_command(ESCCChannelState *s, int val)
     }
     switch (val) {
     case 1: /* Reset, return type code */
-        clear_queue(s);
-        put_queue(s, 0xff);
-        put_queue(s, 4); /* Type 4 */
-        put_queue(s, 0x7f);
+        sunkbd_reply(s, (const uint8_t[]){ 0xff, 4 /* Type 4 */, 0x7f }, 3);
         break;
     case 0xe: /* Set leds */
         s->led_mode = 1;
         break;
     case 7: /* Query layout */
     case 0xf:
-        clear_queue(s);
-        put_queue(s, 0xfe);
-        put_queue(s, sunkbd_layout_dip_switch(s->sunkbd_layout));
+        sunkbd_reply(s, (const uint8_t[]){
+                         0xfe, sunkbd_layout_dip_switch(s->sunkbd_layout) },
+                     2);
         break;
     default:
         break;
@@ -1273,6 +1331,8 @@ static void escc_init1(Object *obj)
     for (i = 0; i < 2; i++) {
         sysbus_init_irq(dev, &s->chn[i].irq);
         s->chn[i].chn = 1 - i;
+        timer_init_ns(&s->chn[i].sunkbd_reply_timer, QEMU_CLOCK_VIRTUAL,
+                      sunkbd_reply_cb, &s->chn[i]);
     }
     s->chn[0].otherchn = &s->chn[1];
     s->chn[1].otherchn = &s->chn[0];
