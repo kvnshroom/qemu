@@ -385,6 +385,17 @@ typedef enum {
  */
 #define M68K_SSW_FC_BIT_030 0x8000
 #define M68K_SSW_FB_030   0x4000
+/*
+ * The rerun flags accompany the fault flags: a real 020/030 leaves
+ * RC/RB set on the stage that faulted so that RTE re-runs its fetch
+ * (a handler clears one to supply the pipe word itself).  SunOS 4.1.1
+ * (sun3 trap.o) copies RC->FC and RB->FB before it decides which stage
+ * to page in; with only FC/FB set it finds no faulted stage and kills
+ * the process with SIGSEGV -- every fork child died on its first
+ * instruction fetch.
+ */
+#define M68K_SSW_RC_030   0x2000
+#define M68K_SSW_RB_030   0x1000
 #define M68K_SSW_DF_030   0x0100
 #define M68K_SSW_RW_030   0x0040
 /*

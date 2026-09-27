@@ -428,9 +428,9 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
 
                 if ((((env->pc + 4) ^ env->mmu.ar) & pmask) == 0 &&
                     (((env->pc + 2) ^ env->mmu.ar) & pmask) != 0) {
-                    env->mmu.ssw |= M68K_SSW_FB_030;
+                    env->mmu.ssw |= M68K_SSW_FB_030 | M68K_SSW_RB_030;
                 } else {
-                    env->mmu.ssw |= M68K_SSW_FC_BIT_030;
+                    env->mmu.ssw |= M68K_SSW_FC_BIT_030 | M68K_SSW_RC_030;
                 }
             }
 
