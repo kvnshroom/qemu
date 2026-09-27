@@ -62,6 +62,7 @@ config SUN3X
     default y
     depends on M68K
     select ESCC
+    select LANCE
     select M68K_IRQC
     select NCR5380
     select OR_IRQ

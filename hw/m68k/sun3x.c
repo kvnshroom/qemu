@@ -40,6 +40,8 @@
 #include "system/blockdev.h"
 #include "hw/intc/m68k_irqc.h"
 #include "hw/core/or-irq.h"
+#include "hw/net/lance.h"
+#include "net/net.h"
 #include "chardev/char.h"
 #include "qemu/timer.h"
 #include "qemu/datadir.h"
@@ -195,6 +197,10 @@ typedef struct Sun3xState {
     DeviceState *zs_orgate;      /* wire-ORs both Z8530s' 4 IRQ outputs onto
                                   * the shared level-6 autovector line, exactly
                                   * like real hardware's open-drain INT wiring */
+    DeviceState *lance_orgate;   /* wire-ORs the "le" LANCE ethernet IRQ and
+                                  * the software interrupt-3 bit onto the
+                                  * shared level-3 autovector line (see
+                                  * sun3x_update_irq()) */
     DeviceState *si_orgate;      /* wire-ORs the "si" NCR5380 SCSI IRQ and the
                                   * software interrupt-2 bit onto the shared
                                   * level-2 autovector line (see
@@ -377,13 +383,19 @@ static void sun3x_update_irq(Sun3xState *s)
      * Software interrupts (SunOS/PROM): writing bit 1/2/3 of the interrupt
      * register raises an autovector interrupt at level 1/2/3.  The Linux shim
      * never sets these bits, so gate on SunOS mode to keep it byte-identical.
+     *
+     * Level 3 is shared with the "le" LANCE ethernet chip's own hardware IRQ
+     * (autoconfig prints "le0 ... pri 3"), so route the software-interrupt-3
+     * bit through s->lance_orgate's second input instead of driving the irqc
+     * gpio directly -- the same "last writer wins" hazard fixed for the two
+     * Z8530s' shared level-6 line via s->zs_orgate applies here too.
      */
     if (s->sunos) {
         qemu_set_irq(qdev_get_gpio_in(s->irqc, 1 - 1),
                      master && (s->intreg & SUN3X_INT_SOFT_1));
         qemu_set_irq(qdev_get_gpio_in(s->si_orgate, 1),
                      master && (s->intreg & SUN3X_INT_SOFT_2));
-        qemu_set_irq(qdev_get_gpio_in(s->irqc, 3 - 1),
+        qemu_set_irq(qdev_get_gpio_in(s->lance_orgate, 1),
                      master && (s->intreg & SUN3X_INT_SOFT_3));
     }
 }
@@ -542,6 +554,84 @@ static bool sun3x_dvma_to_phys(uint32_t dva, hwaddr *pa)
     }
     *pa = ((hwaddr)(pte & 0xffffe000)) | (dva & 0x1fff);
     return true;
+}
+
+/*
+ * Copy a run of bytes between a sun3x DVMA address and main memory, one
+ * byte at a time (exactly like sun3x_si_dma_run() below), so an invalid PTE
+ * partway through a buffer is caught rather than assumed contiguous.
+ */
+static bool sun3x_lance_dvma_copy(uint32_t dva, uint8_t *buf, int len,
+                                  bool to_mem)
+{
+    while (len-- > 0) {
+        hwaddr pa;
+
+        if (!sun3x_dvma_to_phys(dva, &pa)) {
+            return false;
+        }
+        if (to_mem) {
+            stb_phys(&address_space_memory, pa, *buf);
+        } else {
+            *buf = ldub_phys(&address_space_memory, pa);
+        }
+        buf++;
+        dva++;
+    }
+    return true;
+}
+
+/*
+ * hw/net/lance.c's DMA hooks for the "le" LANCE (Am7990), translating the
+ * chip's 24-bit DVMA addresses through the same IOMMU used by the "si" SCSI
+ * pseudo-DMA above, instead of sparc/ledma's IOMMU.
+ *
+ * The sun3lance.c driver (drivers/net/ethernet/amd/sun3lance.c, and SunOS's
+ * equivalent "le" driver) always programs CSR3 with BSWP set, matching the
+ * sun4m sunlance.c driver -- so reuse the exact do_bswap contract hw/net/
+ * lance.c already relies on for sun4m's ledma_memory_read/write() (see
+ * "on sparc, the lance 16 bit bus is swapped" in hw/dma/sparc32_dma.c):
+ * pcnet.c always calls phys_mem_read/write for descriptor/init-block DMA
+ * with do_bswap==0 (so those always get the 16-bit swap below, converting
+ * between memory's big-endian words and the LE fields pcnet.c decodes them
+ * into), and calls it with do_bswap==CSR_BSWP(s) for frame body DMA (BSWP
+ * set means "plain copy", i.e. raw bytes pass through unswapped, which is
+ * what a byte-for-byte Ethernet frame needs).
+ */
+static void sun3x_lance_dma_read(void *opaque, hwaddr addr,
+                                 uint8_t *buf, int len, int do_bswap)
+{
+    if (!sun3x_lance_dvma_copy(addr, buf, len, false)) {
+        memset(buf, 0, len);
+        return;
+    }
+    if (!do_bswap) {
+        int i;
+
+        for (i = 0; i + 1 < len; i += 2) {
+            bswap16s((uint16_t *)(buf + i));
+        }
+    }
+}
+
+static void sun3x_lance_dma_write(void *opaque, hwaddr addr,
+                                  uint8_t *buf, int len, int do_bswap)
+{
+    if (do_bswap) {
+        sun3x_lance_dvma_copy(addr, buf, len, true);
+    } else {
+        g_autofree uint8_t *tmp = g_malloc(len);
+        int i;
+
+        memcpy(tmp, buf, len);
+        for (i = 0; i + 1 < len; i += 2) {
+            uint8_t t = tmp[i];
+
+            tmp[i] = tmp[i + 1];
+            tmp[i + 1] = t;
+        }
+        sun3x_lance_dvma_copy(addr, tmp, len, true);
+    }
 }
 
 /*
@@ -1822,6 +1912,18 @@ static void sun3x_init(MachineState *machine)
     qdev_connect_gpio_out(s->zs_orgate, 0, qdev_get_gpio_in(s->irqc, 6 - 1));
 
     /*
+     * Same open-drain-style OR wiring for the shared level-3 autovector
+     * line: line 0 is the "le" LANCE ethernet IRQ (SunOS mode only, wired
+     * below), line 1 is the software interrupt-3 bit (see
+     * sun3x_update_irq()).  Created unconditionally, like s->zs_orgate,
+     * even though only the softint input is ever driven in Linux mode.
+     */
+    s->lance_orgate = qdev_new(TYPE_OR_IRQ);
+    qdev_prop_set_uint32(s->lance_orgate, "num-lines", 2);
+    qdev_realize_and_unref(s->lance_orgate, NULL, &error_fatal);
+    qdev_connect_gpio_out(s->lance_orgate, 0, qdev_get_gpio_in(s->irqc, 3 - 1));
+
+    /*
      * ...and for the shared level-2 autovector line: line 0 is the "si"
      * NCR5380 SCSI controller's IRQ (SunOS mode only, wired below), line 1
      * is the software interrupt-2 bit.  See the comment on
@@ -2142,6 +2244,51 @@ static void sun3x_init(MachineState *machine)
 
         /* attach -drive if=scsi disks to the si bus */
         scsi_bus_legacy_handle_cmdline(&s->scsi.bus);
+
+        /*
+         * "le" ethernet: an AMD Am7990 LANCE at obio 0x65002000 (autoconfig
+         * prints "le0 at obio 0x65002000 pri 3"), reusing the generic
+         * hw/net/lance.c SysBus wrapper already proven on sparc/sun4m's own
+         * on-board "le".  RDP/RAP sit at the model's usual +0/+2 16-bit
+         * register offsets, matching drivers/net/ethernet/amd/sun3lance.c's
+         * `lp->iobase[0]`/`[1]` (DREG/AREG).  DMA goes through the sun3x
+         * IOMMU/DVMA translator above instead of sparc's ledma, via the
+         * sun3x_lance_dma_read/write() hooks installed on the realized
+         * device's phys_mem_read/phys_mem_write (the same technique used for
+         * the ELTEC E17's ILACC, which likewise overrides them directly
+         * rather than plumbing a new DMA-opaque device through lance.c).
+         */
+        {
+            DeviceState *lance_dev = qdev_new(TYPE_LANCE);
+            SysBusPCNetState *lance = SYSBUS_PCNET(lance_dev);
+            NICInfo *nd = qemu_find_nic_info(TYPE_LANCE, true, NULL);
+            static const MACAddr idprom_mac = {
+                .a = { 0x08, 0x00, 0x20, 0x11, 0x22, 0x33 }
+            };
+
+            if (nd) {
+                qdev_set_nic_properties(lance_dev, nd);
+            }
+            /*
+             * SunOS reads the ethernet address from the IDPROM (see
+             * sun3x_build_nvram() above), not from the chip, and the
+             * sun3lance driver programs that same IDPROM address into the
+             * LANCE's init block itself -- so force the qdev "mac" property
+             * (which otherwise only supplies pcnet's unused emulated address
+             * PROM) to match the machine's fixed IDPROM address instead of
+             * whatever default/user-specified address qemu_find_nic_info()
+             * came back with, keeping the two consistent as the task asks.
+             */
+            qdev_prop_set_macaddr(lance_dev, "mac", idprom_mac.a);
+
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(lance_dev), &error_fatal);
+            lance->state.phys_mem_read = sun3x_lance_dma_read;
+            lance->state.phys_mem_write = sun3x_lance_dma_write;
+            sysbus_mmio_map_overlap(SYS_BUS_DEVICE(lance_dev), 0,
+                                    0x65002000, 1);
+            sysbus_connect_irq(SYS_BUS_DEVICE(lance_dev), 0,
+                               qdev_get_gpio_in(s->lance_orgate, 0));
+        }
 
         /* lowest-priority bus-timeout background: any otherwise-unmapped
          * access latches TIMEOUT and faults (the PROM probes 0x40000000). */
