@@ -1,3 +1,19 @@
+.. _M68K-System-emulator:
+
+m68k System emulator
+--------------------
+
+Use the executable ``qemu-system-m68k`` to emulate Motorola 68000
+family machines.
+
+Board-specific documentation
+============================
+
+.. toctree::
+   :maxdepth: 1
+
+   m68k/sun3
+
 .. _ColdFire-System-emulator:
 
 ColdFire System emulator
