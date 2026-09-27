@@ -767,6 +767,20 @@ static void pcnet_update_irq(PCNetState *s)
     s->isr = isr;
 }
 
+/*
+ * The chip, as bus master, got no acknowledge for a DMA cycle (e.g. a
+ * board's DVMA translation faulted).  Am7990 datasheet, CSR0 MERR: "When
+ * a Memory Error occurs, the receiver and transmitter are turned off
+ * (CSR0, RXON = TXON = 0).  Since MERR is an error, ERR is set."  ERR is
+ * derived on read (pcnet_csr_readw); the interrupt follows CSR3 MERRM.
+ */
+void pcnet_dma_error(PCNetState *s)
+{
+    s->csr[0] |= 0x0800;        /* MERR */
+    s->csr[0] &= ~0x0030;       /* RXON, TXON */
+    pcnet_update_irq(s);
+}
+
 static void pcnet_init(PCNetState *s)
 {
     int rlen, tlen;

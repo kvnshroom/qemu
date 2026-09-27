@@ -56,6 +56,7 @@ struct PCNetState_st {
 };
 
 void pcnet_h_reset(void *opaque);
+void pcnet_dma_error(PCNetState *s);
 void pcnet_ioport_writew(void *opaque, uint32_t addr, uint32_t val);
 uint32_t pcnet_ioport_readw(void *opaque, uint32_t addr);
 void pcnet_ioport_writel(void *opaque, uint32_t addr, uint32_t val);
