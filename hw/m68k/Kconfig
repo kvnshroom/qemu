@@ -63,4 +63,5 @@ config SUN3X
     depends on M68K
     select ESCC
     select M68K_IRQC
+    select NCR5380
     select OR_IRQ

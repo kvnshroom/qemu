@@ -35,6 +35,9 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/char/escc.h"
+#include "hw/scsi/ncr5380.h"
+#include "hw/scsi/scsi.h"
+#include "system/blockdev.h"
 #include "hw/intc/m68k_irqc.h"
 #include "hw/core/or-irq.h"
 #include "chardev/char.h"
@@ -192,6 +195,10 @@ typedef struct Sun3xState {
     DeviceState *zs_orgate;      /* wire-ORs both Z8530s' 4 IRQ outputs onto
                                   * the shared level-6 autovector line, exactly
                                   * like real hardware's open-drain INT wiring */
+    DeviceState *si_orgate;      /* wire-ORs the "si" NCR5380 SCSI IRQ and the
+                                  * software interrupt-2 bit onto the shared
+                                  * level-2 autovector line (see
+                                  * sun3x_update_irq()) */
 
     MemoryRegion bg;            /* absorb/zero background */
     MemoryRegion iommu;         /* DVMA page table scratch */
@@ -218,12 +225,22 @@ typedef struct Sun3xState {
     MemoryRegion clkstat2;      /* SunOS: kernel-side clock int-pending
                                  * @ 0x64002010 (see SUN3X_CLK_STAT2) */
 
+    NCR5380State scsi;          /* SunOS: "si" NCR5380 @ 0x66000000 */
+    MemoryRegion sireg;         /* SunOS: si DMA/CSR block @ 0x66001000 */
     MemoryRegion fdc;           /* SunOS: 82072 FDC @ 0x6e000000 (no drive) */
     uint8_t fdc_st0;            /* FDC: pending SENSE-INTERRUPT ST0 result */
     uint8_t fdc_fifo[8];        /* FDC: result bytes to return via data reg */
     uint8_t fdc_res_len, fdc_res_pos;
     uint8_t fdc_cmd[8];        /* FDC: command bytes being collected */
     uint8_t fdc_cmd_len, fdc_cmd_need;
+    uint32_t si_dma_addr;       /* si DMA address (into DVMA space) */
+    uint32_t si_dma_count;      /* si DMA byte count */
+    uint16_t si_csr;            /* si control/status register */
+    bool si_irq_raw;            /* raw NCR5380 /IRQ level (forwarded as-is) */
+    uint8_t si_reg20;           /* si scratch register @ +0x20 (read-back) */
+    uint8_t si_reg24;           /* si dma-control scratch @ +0x24 */
+    uint8_t si_reg2c;           /* si scratch @ +0x2c */
+    MemoryRegion siscratch;     /* si scratch overlay reclaiming +0x20/+0x24 */
 
     bool sunos;                 /* real-PROM (SunOS) mode */
     uint8_t buserr;             /* SunOS bus error register latch */
@@ -364,7 +381,7 @@ static void sun3x_update_irq(Sun3xState *s)
     if (s->sunos) {
         qemu_set_irq(qdev_get_gpio_in(s->irqc, 1 - 1),
                      master && (s->intreg & SUN3X_INT_SOFT_1));
-        qemu_set_irq(qdev_get_gpio_in(s->irqc, 2 - 1),
+        qemu_set_irq(qdev_get_gpio_in(s->si_orgate, 1),
                      master && (s->intreg & SUN3X_INT_SOFT_2));
         qemu_set_irq(qdev_get_gpio_in(s->irqc, 3 - 1),
                      master && (s->intreg & SUN3X_INT_SOFT_3));
@@ -430,6 +447,447 @@ static const MemoryRegionOps sun3x_clkstat_ops = {
  * the SAME ops/state as sun3x_clkstat_ops, just registered at the alias
  * address.
  */
+
+/* --- SunOS "si" NCR5380 DMA/CSR block (0x66000008.. and 0x66001000) --- */
+
+/* si control/status register bits (authoritative, NetBSD sun3 sireg.h) */
+#define SI_CSR_DMA_ACTIVE   0x8000  /* r/o */
+#define SI_CSR_DMA_CONFLICT 0x4000  /* r/o */
+#define SI_CSR_DMA_BUS_ERR  0x2000  /* r/o */
+#define SI_CSR_ID           0x1000  /* r/o: 1=SCSI-3/EMULEX */
+#define SI_CSR_FIFO_FULL    0x0800  /* r/o */
+#define SI_CSR_FIFO_EMPTY   0x0400  /* r/o */
+#define SI_CSR_SBC_IP       0x0200  /* r/o: 5380 interrupt pending */
+#define SI_CSR_DMA_IP       0x0100  /* r/o: DMA interrupt pending */
+#define SI_CSR_DMA_EN       0x0010  /* r/w: DMA enable */
+#define SI_CSR_SEND         0x0008  /* r/w: DMA direction 1=to device */
+#define SI_CSR_INTR_EN      0x0004  /* r/w: interrupt enable */
+#define SI_CSR_FIFO_RES     0x0002  /* r/w: fifo reset */
+#define SI_CSR_SCSI_RES     0x0001  /* r/w: scsi bus reset */
+/*
+ * The real reset strobe on this hardware is bit 0x80, not SI_CSR_SCSI_RES
+ * (0x0001) above despite that bit's NetBSD-derived name: bit 0 toggles on
+ * every ordinary command's finalise sequence (~4000 traced si_csr writes),
+ * while the PROM self-test's, ufsboot's and the kernel "sm" driver's
+ * sm_reset() bus-reset sequences all write si_csr=0x80 then si_csr=0
+ * (kernel text 0xf8075158/0xf8075174, matching the console's "resetting
+ * scsi bus" print one-for-one) and never set 0x80 otherwise.
+ */
+#define SI_CSR_SUN_RESET    0x0080  /* w/o: genuine SCSI bus reset strobe */
+
+/*
+ * Forward the NCR5380's raw /IRQ output to the OBIO level-2 line,
+ * unconditionally: the kernel "sm" driver never writes SI_CSR_INTR_EN
+ * (0x0004), not even in post-boot I/O, so gating the line on it (once tried
+ * to silence a storm) merely disabled the interrupt and left the driver's
+ * interrupt-driven launch path (`tstl %d5; beqs <busy-poll>` after the
+ * select write at 0xf8073170) sleeping in tsleep()/biowait() forever.  The
+ * kernel masks level 2 in SR while it polls the hardware during autoconfig,
+ * so 1:1 wiring does not storm there; the few unclaimable pulses left by
+ * ncr5380.c's "sun_cmd_complete trailing calls" after `dev` has gone NULL
+ * are bounded and reaped by ncr5380_sun_reap_stale_irq().
+ */
+static void sun3x_si_update_irq(Sun3xState *s)
+{
+    /*
+     * Level 2 is SHARED: the "si" NCR5380 SCSI controller (autoconfig prints
+     * "sm0 at obio 0x66000000 pri 2") and the interrupt register's
+     * software-interrupt-2 bit both drive this one autovector line.  Route
+     * both through s->si_orgate instead of driving the irqc gpio directly --
+     * the same open-drain wire-OR topology already used for the two Z8530s'
+     * shared level-6 line (s->zs_orgate) and for the LANCE/software-
+     * interrupt-3 pair (s->lance_orgate).
+     *
+     * Driving the gpio directly from both places is "last writer wins", and
+     * that lost real SCSI completions: sun3x_update_irq() unconditionally
+     * re-drives the level-2 input from the SOFT_2 bit alone, and it runs
+     * 200 times a second from sun3x_tick() plus on every single interrupt-
+     * register write -- including the hardclock ISR's own two-write
+     * `andib #~0x20 / orib #0x20` ack pulse, every 10 ms tick.  Any si
+     * interrupt request the CPU had not yet taken was therefore destroyed at
+     * the interrupt controller (m68k_irqc's per-level `ipr` bit cleared),
+     * while the si model itself still held its own line asserted
+     * (s->si_irq_raw == 1, BSR_IRQ set) with nothing left to re-assert the
+     * gpio.  The sleeping process was then never woken and the driver's own
+     * 60-140 s watchdog eventually declared "sm0: sm_deque: lost interrupt"
+     * / "sd0: I/O request timeout" / "sm0: resetting scsi bus".  Evidence:
+     * 557 consecutive 200 ms samples of a stalled guest, all in the
+     * kernel's idle loop (pc 0xf80645d8) at SR 0x2000, i.e. IPL 0, with
+     * s->si_irq_raw == 1 and a command still in flight.
+     */
+    qemu_set_irq(qdev_get_gpio_in(s->si_orgate, 0), s->si_irq_raw);
+}
+
+static void sun3x_si_irq(void *opaque, int n, int level)
+{
+    Sun3xState *s = opaque;
+
+    s->si_irq_raw = level;
+    sun3x_si_update_irq(s);
+}
+
+/*
+ * Translate a sun3x DVMA address to a physical main-memory address using the
+ * IOMMU page table the PROM builds at SUN3X_IOMMU: 16 MiB DVMA space, 8 KiB
+ * pages, 2048 PTEs of 4 bytes.  PTE valid when the low bits are set;
+ * phys = (pte & 0xffffe000) | (dva & 0x1fff).
+ */
+static bool sun3x_dvma_to_phys(uint32_t dva, hwaddr *pa)
+{
+    uint32_t idx = (dva >> 13) & 0x7ff;
+    uint32_t pte = ldl_be_phys(&address_space_memory, SUN3X_IOMMU + idx * 4);
+
+    if (!(pte & 0x3)) {
+        return false;               /* invalid mapping */
+    }
+    *pa = ((hwaddr)(pte & 0xffffe000)) | (dva & 0x1fff);
+    return true;
+}
+
+/*
+ * Run the si pseudo-DMA engine: move up to si_dma_count bytes between the
+ * NCR5380 data phase and DVMA memory (through the IOMMU).  SI_CSR_SEND set
+ * means data-out (initiator -> target).  Sets DMA_IP when the run drains.
+ */
+static void sun3x_si_dma_run(Sun3xState *s)
+{
+    NCR5380State *n = &s->scsi;
+    bool out;
+
+    /*
+     * Direction comes from the 5380's live data phase, NOT the si_csr bits.
+     * The PROM's DMA-arm (0xfeff0e04) encodes a data-IN read as si_csr|=0x300
+     * (SBC_IP|DMA_IP) and a data-OUT write as si_csr|=0x200 (SBC_IP only) —
+     * the opposite of a naive SEND/DMA_IP reading — so inferring the direction
+     * from those bits would run the transfer the wrong way and move nothing.
+     * The bus phase (set by the SCSI command executed at selection) is
+     * authoritative.
+     */
+    if (ncr5380_pdma_ready(n, false)) {
+        out = false;                    /* data-in  (READ/INQUIRY/...) */
+    } else if (ncr5380_pdma_ready(n, true)) {
+        out = true;                     /* data-out (WRITE/MODE SELECT) */
+    } else {
+        s->si_csr |= SI_CSR_DMA_IP;     /* nothing to move */
+        return;
+    }
+
+    while (s->si_dma_count > 0 && ncr5380_pdma_ready(n, out)) {
+        hwaddr pa;
+
+        if (!sun3x_dvma_to_phys(s->si_dma_addr, &pa)) {
+            s->si_csr |= SI_CSR_DMA_BUS_ERR;
+            break;
+        }
+        if (out) {
+            uint8_t b = ldub_phys(&address_space_memory, pa);
+            ncr5380_pdma_write(n, b);
+        } else {
+            uint8_t b = ncr5380_pdma_read(n);
+            stb_phys(&address_space_memory, pa, b);
+        }
+        s->si_dma_addr++;
+        s->si_dma_count--;
+    }
+    s->si_csr |= SI_CSR_DMA_IP;      /* DMA interrupt / transfer done */
+}
+
+/* the guest PC, for the register trace and the kernel-vs-PROM/ufsboot gate */
+static unsigned sun3x_guest_pc(void)
+{
+    if (current_cpu) {
+        CPUClass *cc = CPU_GET_CLASS(current_cpu);
+        if (cc->get_pc) {
+            return (unsigned)cc->get_pc(current_cpu);
+        }
+    }
+    return 0;
+}
+
+static uint64_t sun3x_sireg_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Sun3xState *s = opaque;
+    uint64_t v = 0;
+
+    switch (addr) {
+    case 0x00:              /* DMA transfer count, low byte */
+        v = s->si_dma_count & 0xff;
+        break;
+    case 0x04:              /* DMA transfer count, high byte */
+        v = (s->si_dma_count >> 8) & 0xff;
+        break;
+    case 0x20:              /* si scratch register (read-back register test) */
+        v = s->si_reg20;
+        break;
+    case 0x24:              /* si dma-control scratch (read-back) */
+        v = s->si_reg24;
+        break;
+    case 0x2c:              /* si scratch (read-back; failure tolerated) */
+        v = s->si_reg2c;
+        break;
+    case 0x1000: {          /* si control/status register.
+                             * Progress gate needs bit0(0x1)=1, FIFO_RES(0x2)=0,
+                             * FIFO_EMPTY(0x400)=0.  SBC_IP/DMA_IP are the
+                             * driver's DMA-sequencing latches; the 0x40
+                             * handshake bit reads back clear (completes at
+                             * once). */
+        uint16_t v16 = SI_CSR_ID;
+        unsigned pc = sun3x_guest_pc();
+        v16 |= (s->si_csr & (SI_CSR_SBC_IP | SI_CSR_DMA_IP));
+        /*
+         * bit0 = "bus/command busy".  The SunOS kernel "sm" driver polls bit0
+         * as its completion gate: its state-machine inner loop (0xf8074dc2)
+         * re-runs the body WHILE bit0 == 1 and exits (command complete) when
+         * bit0 == 0, its entry gate (0xf80735c2, si_csr & 3) needs bit0 == 1 to
+         * run at all, and its poll loop (0xf8073548) calls the state machine
+         * only while si_csr & 3.  So for the kernel present bit0 = 1 only while
+         * a device is selected (a command in flight): a present target holds
+         * bit0 = 1 through the command and drops to 0 at bus-free (-> its
+         * state-28 completion); an absent target reads bit0 = 0 (-> its
+         * no-device path) instead of an infinite spin.  The PROM/ufsboot polled
+         * path keeps bit0 hardwired to 1 as before -- their self-test and
+         * arbitration prologue read si_csr bit0 expecting 1 even with no device
+         * selected.  The kernel and PROM read the si_csr at the SAME offset
+         * (0x1000), so distinguish by the guest PC: only the kernel text
+         * (0xf8000000..0xf9000000) sees the busy semantics; the PROM
+         * (0xfefexxxx) and ufsboot (0x0021xxxx) keep bit0 = 1.
+         */
+        if (pc >= 0xf8000000u && pc < 0xf9000000u) {
+            v16 |= s->scsi.dev ? 0x0001 : 0;
+            if (!(v16 & 0x0001)) {
+                if (s->scsi.sun_sel_failed) {
+                    /*
+                     * A selection just failed (no target) under the
+                     * interrupt-driven regime: ncr5380_select_target() raised
+                     * BSR_IRQ for exactly this read.  Present
+                     * SBC_IP|FIFO_EMPTY -- the kernel "sm" interrupt handler's
+                     * own gate (SBC_IP) and its next check (FIFO_EMPTY, since
+                     * no data phase ever ran) -- so it takes its existing
+                     * bounded spin -> "err 0x12" -> claimed-complete path
+                     * instead of no-op'ing on a clear SBC_IP.  One-shot: a
+                     * fresh selection clears sun_sel_failed before this can
+                     * be read again, and normal reg7-less reaping resumes.
+                     */
+                    v16 |= SI_CSR_SBC_IP | SI_CSR_FIFO_EMPTY;
+                    s->scsi.sun_sel_failed = false;
+                } else if (s->scsi.sun_cmd_irq) {
+                    /*
+                     * A kernel-mode, interrupt-driven command just completed
+                     * (ncr5380_ack()'s kernel-gated PHASE_MI branch raised
+                     * BSR_IRQ -- see the sun_cmd_irq comment in ncr5380.h).
+                     * The isrlink contract, from the real /vmunix, needs
+                     * bit1 set for a short, fixed run of si_csr reads while
+                     * one completion is dispatched: the level-2 dispatch
+                     * loop's claim test (`(reg)&3`) before it JSRs into the
+                     * device handler, the handler's own entry recheck (same
+                     * `&3` mask, "err 0x13" if clear) and its state-machine
+                     * entry gate (`(reg) & 0x402`).  Gating those on the
+                     * handler's PC locks the model to one kernel binary's
+                     * link addresses (GENERIC links _sm_intr at 0xf80bdf0e,
+                     * the MINIROOT at 0xf8073586) and stormed the installed
+                     * system; the access pattern is what is invariant --
+                     * one bit0-only read from the state-machine inner loop,
+                     * then exactly three reads that need bit1 (~115 traced
+                     * completions) -- so bit1 is presented for the first
+                     * four si_csr reads after arming (sun_cmd_irq_reads),
+                     * with no PC check.
+                     */
+                    v16 |= 0x0002;
+                    if (--s->scsi.sun_cmd_irq_reads <= 0) {
+                        s->scsi.sun_cmd_irq = false;
+                    }
+                } else {
+                    /*
+                     * The kernel's isrlink claim test just found nothing to
+                     * claim (si_csr & 3 == 0).  If the raw NCR5380 /IRQ is
+                     * still asserted, its cause is already stale (see the
+                     * comment on ncr5380_sun_reap_stale_irq()) -- reap it now
+                     * instead of leaving the physical line permanently up,
+                     * which would storm every single instruction the CPU is
+                     * unmasked.  ncr5380_update_irq() -> qemu_set_irq() ->
+                     * sun3x_si_irq() keeps si_irq_raw and the forwarded OBIO
+                     * line in sync.
+                     */
+                    ncr5380_sun_reap_stale_irq(&s->scsi);
+                }
+            }
+        } else {
+            v16 |= 0x0001;
+        }
+        v = v16;
+        break;
+    }
+    case 0x1004:            /* si DMA address (HW auto-increments during xfer) */
+        v = s->si_dma_addr;
+        break;
+    case 0x1008:            /* si DMA byte count (register test) */
+        v = s->si_dma_count;
+        break;
+    default:
+        v = 0;
+        break;
+    }
+    qemu_log_mask(CPU_LOG_MMU, "si rd  @%08x.%u = %08x pc=%08x\n",
+                  0x66000000 + (uint32_t)addr, size, (uint32_t)v,
+                  sun3x_guest_pc());
+    return v;
+}
+
+/*
+ * Arm the si DMA engine once every register it needs is actually in place.
+ * The PROM/ufsboot driver loads dma_addr and the count latches BEFORE it
+ * writes si_csr|=SBC_IP (the old, sole call site below), so triggering the
+ * run on that write alone was sufficient for it.  The SunOS kernel "sm"
+ * driver's real, interrupt-driven regime writes these same registers in a
+ * DIFFERENT order -- traced live (READ(6)/INQUIRY, `-d mmu` with PC on every
+ * si access): dma_addr, THEN si_csr|=SBC_IP|DMA_IP (0xf80732b2/0xf80732c6),
+ * THEN the count latches (0xf807335a/0xf8073364) -- so the old single call
+ * site always ran the engine while si_dma_count was still 0, moved zero
+ * bytes, and immediately latched sun_dma_done, permanently swallowing the
+ * transfer: the driver read dma_addr back unchanged and reported a full
+ * residual ("count= 56(56)"/"count= 512(512)", 0 bytes moved) even though
+ * ncr5380's own synchronous SCSI-layer pump had the whole reply sitting in
+ * dbuf already, then hit the *Lost Busy* wall.  Call this from every one of
+ * the four register writes that can complete the "armed" state (both count
+ * bytes, the 32-bit count alias, and the si_csr arm write itself) so the run
+ * fires the moment the last of them lands, regardless of order: real si
+ * hardware does not care which of its own registers the driver loads first,
+ * only that all of them are loaded before the transfer is expected to move
+ * data.
+ */
+static void sun3x_si_maybe_run_dma(Sun3xState *s)
+{
+    if ((s->si_csr & SI_CSR_SBC_IP) && !s->scsi.sun_dma_done &&
+        s->si_dma_count > 0 &&
+        (ncr5380_pdma_ready(&s->scsi, false) ||
+         ncr5380_pdma_ready(&s->scsi, true))) {
+        sun3x_si_dma_run(s);
+        s->scsi.sun_dma_done = true;
+        /*
+         * Real hardware re-asserts /REQ for the driver's very next poll
+         * the instant this drain happens; latch that so the kernel "sm"
+         * driver's reg3 dispatch does not mis-route (see the
+         * sun_dma_drained_pending comment in ncr5380.h).
+         */
+        ncr5380_sun_dma_drained(&s->scsi);
+    }
+}
+
+static void sun3x_sireg_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    Sun3xState *s = opaque;
+
+    switch (addr) {
+    case 0x00:              /* DMA transfer count, low byte */
+        s->si_dma_count = (s->si_dma_count & 0xff00) | (val & 0xff);
+        sun3x_si_maybe_run_dma(s);
+        break;
+    case 0x04:              /* DMA transfer count, high byte */
+        s->si_dma_count = (s->si_dma_count & 0x00ff) | ((val & 0xff) << 8);
+        sun3x_si_maybe_run_dma(s);
+        break;
+    case 0x20:
+        s->si_reg20 = val;
+        break;
+    case 0x24:
+        s->si_reg24 = val;
+        break;
+    case 0x2c:
+        s->si_reg2c = val;
+        break;
+    case 0x1000: {
+        uint16_t old = s->si_csr;
+        s->si_csr = val & 0x03ff;
+        if (val & SI_CSR_SUN_RESET) {
+            /*
+             * Genuine bus reset (see the SI_CSR_SUN_RESET comment above):
+             * cancel any still-open SCSI request and clear the 5380's whole
+             * bus/transaction state, then drop the si-side DMA latches too
+             * so a subsequent, freshly-armed transfer can never inherit a
+             * stale address/count from whatever this reset just abandoned.
+             */
+            ncr5380_sun_bus_reset(&s->scsi);
+            s->si_dma_addr = 0;
+            s->si_dma_count = 0;
+        }
+        /*
+         * The driver arms a transfer by writing SBC_IP(0x200) [plus DMA_IP
+         * for data-in] after loading dma_addr and the count latches; the
+         * engine latches DMA_IP on completion and advances dma_addr by the
+         * transfer length, which is the byte count the PROM reads back
+         * (dma_addr - start) to decide the transfer succeeded.  Gate on
+         * sun_dma_done (cleared by ncr5380_do_command
+         * for each new command) rather than a rising-edge of SBC_IP -- si_csr
+         * is not reliably cleared to 0 between commands (its bits are
+         * synthesised on read), so a stale SBC_IP from the previous transfer
+         * would otherwise swallow the next arm's edge and the DMA would never
+         * run.  See sun3x_si_maybe_run_dma(): this call handles the
+         * PROM/ufsboot ordering (count already loaded); the kernel's
+         * count-after-arm ordering is handled by the same helper called from
+         * the count-register writes above/below.
+         */
+        sun3x_si_maybe_run_dma(s);
+        /*
+         * The driver's data-complete path (0xfeff0e6e) clears the DMA
+         * interrupt latches (si_csr &= ~0x0300) once it has read the byte
+         * count back.  On that falling edge, advance the SCSI bus to STATUS
+         * so the driver's status/message handshake can run.
+         */
+        if (s->scsi.sun_dma_done &&
+            (old & (SI_CSR_SBC_IP | SI_CSR_DMA_IP)) &&
+            !(val & (SI_CSR_SBC_IP | SI_CSR_DMA_IP))) {
+            ncr5380_sun_to_status(&s->scsi);
+        }
+        /* re-drive the level-2 line from the 5380's current raw /IRQ */
+        sun3x_si_update_irq(s);
+        break;
+    }
+    case 0x1004:
+        s->si_dma_addr = val;
+        sun3x_si_maybe_run_dma(s);
+        break;
+    case 0x1008:
+        s->si_dma_count = val;
+        sun3x_si_maybe_run_dma(s);
+        break;
+    default:
+        break;
+    }
+    qemu_log_mask(CPU_LOG_MMU, "si wr  @%08x.%u = %08x pc=%08x\n",
+                  0x66000000 + (uint32_t)addr, size, (uint32_t)val,
+                  sun3x_guest_pc());
+}
+
+static const MemoryRegionOps sun3x_sireg_ops = {
+    .read = sun3x_sireg_read,
+    .write = sun3x_sireg_write,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
+/*
+ * The NCR5380 sits at 0x66000008..0x66000027 (reg0 = data @ +0x08), which
+ * overlaps the si scratch registers at +0x20/+0x24.  Reclaim those two words
+ * at higher priority and forward them to the sireg handlers above.
+ */
+static uint64_t sun3x_siscratch_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return sun3x_sireg_read(opaque, addr + 0x20, size);
+}
+
+static void sun3x_siscratch_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    sun3x_sireg_write(opaque, addr + 0x20, val, size);
+}
+
+static const MemoryRegionOps sun3x_siscratch_ops = {
+    .read = sun3x_siscratch_read,
+    .write = sun3x_siscratch_write,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .endianness = DEVICE_BIG_ENDIAN,
+};
 
 static uint64_t sun3x_intreg_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -1364,6 +1822,17 @@ static void sun3x_init(MachineState *machine)
     qdev_connect_gpio_out(s->zs_orgate, 0, qdev_get_gpio_in(s->irqc, 6 - 1));
 
     /*
+     * ...and for the shared level-2 autovector line: line 0 is the "si"
+     * NCR5380 SCSI controller's IRQ (SunOS mode only, wired below), line 1
+     * is the software interrupt-2 bit.  See the comment on
+     * sun3x_si_update_irq() for the completion-losing bug this fixes.
+     */
+    s->si_orgate = qdev_new(TYPE_OR_IRQ);
+    qdev_prop_set_uint32(s->si_orgate, "num-lines", 2);
+    qdev_realize_and_unref(s->si_orgate, NULL, &error_fatal);
+    qdev_connect_gpio_out(s->si_orgate, 0, qdev_get_gpio_in(s->irqc, 2 - 1));
+
+    /*
      * Linux shim mode: zero/absorb background over the whole space (the Linux
      * sun3x port does no bus-error probing; RAM comes from BI_MEMCHUNK and
      * devices are at fixed addrs).  SunOS mode deliberately omits this so that
@@ -1640,6 +2109,39 @@ static void sun3x_init(MachineState *machine)
                               "sun3x.clkstat2", 1);
         memory_region_add_subregion_overlap(sysmem, SUN3X_CLK_STAT2,
                                             &s->clkstat2, 1);
+
+        /*
+         * "si" SCSI: an NCR5380 (OBIO_EMULEX_SCSI @ 0x66000000) plus a DMA/CSR
+         * block in the same 8 KiB window.  The 5380's 8 registers are spaced
+         * 4 bytes apart (reg-shift 2) and occupy 0x66000000..0x6600001f; the
+         * si DMA/control registers overlay the rest at lower priority.
+         * Interrupt is autovector level 2 (ipl 2).
+         */
+        object_initialize_child(OBJECT(machine), "si", &s->scsi, TYPE_NCR5380);
+        qdev_prop_set_uint8(DEVICE(&s->scsi), "reg-shift", 2);
+        qdev_prop_set_bit(DEVICE(&s->scsi), "sun-mode", true);
+        sysbus_realize(SYS_BUS_DEVICE(&s->scsi), &error_fatal);
+        memory_region_init_io(&s->sireg, NULL, &sun3x_sireg_ops, s,
+                              "sun3x.si", 0x2000);
+        memory_region_add_subregion_overlap(sysmem, 0x66000000, &s->sireg, 1);
+        /* NCR5380 reg0 (data) is at 0x66000008; regs 0..7 are 4 bytes apart. */
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(&s->scsi), 0, 0x66000008, 2);
+        /* reclaim si scratch regs +0x20/+0x24 that fall inside the 5380 win */
+        memory_region_init_io(&s->siscratch, NULL, &sun3x_siscratch_ops, s,
+                              "sun3x.si.scratch", 0x08);
+        memory_region_add_subregion_overlap(sysmem, 0x66000020,
+                                            &s->siscratch, 3);
+        /*
+         * Routed through sun3x_si_irq()/sun3x_si_update_irq() rather than a
+         * direct sysbus_connect_irq() 1:1 wire purely so the raw level is
+         * tracked in si_irq_raw for bookkeeping; see the comment above
+         * sun3x_si_update_irq() for why it is forwarded unconditionally.
+         */
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->scsi), 0,
+                           qemu_allocate_irq(sun3x_si_irq, s, 0));
+
+        /* attach -drive if=scsi disks to the si bus */
+        scsi_bus_legacy_handle_cmdline(&s->scsi.bus);
 
         /* lowest-priority bus-timeout background: any otherwise-unmapped
          * access latches TIMEOUT and faults (the PROM probes 0x40000000). */
