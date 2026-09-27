@@ -65,6 +65,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/char/escc.h"
+#include "hw/net/lance.h"
 #include "hw/rtc/icm7170.h"
 #include "hw/scsi/ncr5380.h"
 #include "hw/scsi/scsi.h"
@@ -335,6 +336,10 @@ struct Sun3MachineState {
     bool udc_active;
     bool udc_ip;                /* DMA interrupt pending */
     QEMUTimer si_dma_timer;     /* the transfer runs after the start */
+
+    /* "le" LANCE ethernet */
+    SysBusPCNetState *lance;
+    MemoryRegion lance_mr;
 
     uint32_t reset_sp;
     uint32_t reset_pc;
@@ -1400,6 +1405,114 @@ static void sun3_si_reset(Sun3MachineState *m)
     sun3_si_udc_reset(m);
 }
 
+/* --- "le" ethernet: Am7990 LANCE at obio 0x120000 --- */
+
+/*
+ * The LANCE's two 16-bit registers, RDP at +0 and RAP at +2 (PROM le
+ * driver at ROM 0xFEF75DA, NetBSD lewrcsr/lerdcsr, SunOS leinit: all
+ * write the CSR number to +2 and the value to +0).  Both firmware and
+ * SunOS also reach them with byte cycles: the PROM selects a CSR with
+ * `andib #-4,(3,a4)` / `orib #n,(3,a4)` on RAP's low byte (ROM 0xFEF75F4
+ * -- the access whose bus error aborted the auto-boot before this device
+ * existed), and SunOS's leprobe() is a byte pokec() of 0 to RDP.  On the
+ * 68020's dynamically sized bus a byte write to a 16-bit port is one word
+ * cycle with the byte duplicated on both lanes, and a byte read a word
+ * cycle of which the CPU keeps its lane; that is modelled here on top of
+ * the pcnet core's word accessors instead of a read-modify-write, which
+ * would write CSR0's write-1-to-clear bits back into the chip.
+ */
+static uint64_t sun3_lance_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Sun3MachineState *m = opaque;
+    uint32_t val = pcnet_ioport_readw(&m->lance->state, addr & ~1);
+
+    if (size == 1) {
+        return (addr & 1) ? val & 0xff : (val >> 8) & 0xff;
+    }
+    return val & 0xffff;
+}
+
+static void sun3_lance_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    Sun3MachineState *m = opaque;
+
+    if (size == 1) {
+        val = (val & 0xff) * 0x0101;
+    }
+    pcnet_ioport_writew(&m->lance->state, addr & ~1, val & 0xffff);
+}
+
+static const MemoryRegionOps sun3_lance_ops = {
+    .read = sun3_lance_read,
+    .write = sun3_lance_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+};
+
+/*
+ * hw/net/pcnet.c's DMA hooks.  The LANCE presents a 24-bit address which
+ * the board translates exactly like the si's UDC above: VA 0x0F000000 |
+ * addr through the CPU's MMU in the current context (SunOS's kernel heap
+ * -- Sysbase 0x0F000000..Syslimit 0x0F806000, where le_alloc_buffers()
+ * kmem_zalloc()s the init block, rings and buffers -- and NetBSD's DVMA
+ * window 0x0FF00000.. both sit inside it; the PROM's le_xmit uses a
+ * buffer in place only if (va & 0x0F000000) == 0x0F000000).  A fault is
+ * the chip's error, CSR0 MERR, not a CPU bus error.
+ *
+ * Byte order: the Sun wiring puts the even (big-endian high) byte of a
+ * memory word on DAL15-8, and every driver here sets CSR3 BSWP (= 4).
+ * pcnet.c reads descriptors and the init block with do_bswap == 0 and
+ * decodes them little-endian, so those get a 16-bit swap (the init
+ * block's PADR is stored ea[1],ea[0],ea[3],ea[2].. by the PROM and SunOS
+ * alike, which after the swap is the plain address pcnet expects); frame
+ * bodies come with do_bswap == BSWP == 1 and pass through byte for byte.
+ * Same contract as sun4m's ledma_memory_read/write and the sun3x le.
+ */
+static void sun3_lance_dma_read(void *opaque, hwaddr addr, uint8_t *buf,
+                                int len, int do_bswap)
+{
+    Sun3MachineState *m = SUN3_MACHINE(qdev_get_machine());
+    int i;
+
+    if (!sun3_dvma_rw(m, addr, buf, len, false)) {
+        memset(buf, 0, len);
+        pcnet_dma_error(&m->lance->state);
+        return;
+    }
+    if (!do_bswap) {
+        for (i = 0; i + 1 < len; i += 2) {
+            bswap16s((uint16_t *)(buf + i));
+        }
+    }
+}
+
+static void sun3_lance_dma_write(void *opaque, hwaddr addr, uint8_t *buf,
+                                 int len, int do_bswap)
+{
+    Sun3MachineState *m = SUN3_MACHINE(qdev_get_machine());
+    g_autofree uint8_t *tmp = NULL;
+    int i;
+
+    if (!do_bswap) {
+        tmp = g_memdup2(buf, len);
+        for (i = 0; i + 1 < len; i += 2) {
+            bswap16s((uint16_t *)(tmp + i));
+        }
+        buf = tmp;
+    }
+    if (!sun3_dvma_rw(m, addr, buf, len, true)) {
+        pcnet_dma_error(&m->lance->state);
+    }
+}
+
 /* --- IDPROM --- */
 
 static void sun3_build_idprom(Sun3MachineState *m, const MACAddr *mac)
@@ -1683,6 +1796,43 @@ static void sun3_init(MachineState *machine)
     timer_init_ns(&m->si_dma_timer, QEMU_CLOCK_VIRTUAL,
                   sun3_si_dma_timer_cb, m);
     scsi_bus_legacy_handle_cmdline(&m->si_sbc.bus);
+
+    /*
+     * "le" LANCE ethernet at obio 0x120000, interrupt level 3 through its
+     * own per-source line (see sun3_lance_ops / sun3_lance_dma_read above
+     * for the register and DVMA contracts).  Modelled only when a NIC of
+     * model "lance" is configured (-nic user,model=lance): without one
+     * the PROM's auto-boot keeps bus-erroring on its le probe and falling
+     * into the monitor as before, which the kernel-injection tooling
+     * relies on -- with the chip present a diskless auto-boot instead
+     * RARPs forever ("Requesting Internet address for ...").  An
+     * implicit default NIC has no model and so does not count; neither
+     * does a plain "-nic user".  The guest never asks the chip for its
+     * address: the PROM, SunOS (localetheraddr) and NetBSD all take it
+     * from the IDPROM and program it into the init block themselves, so
+     * the qdev "mac" is forced to the IDPROM address to keep the two (and
+     * `info network`) consistent.
+     */
+    {
+        NICInfo *nd = qemu_find_nic_info(TYPE_LANCE, false, NULL);
+
+        if (nd) {
+            dev = qdev_new(TYPE_LANCE);
+            qdev_set_nic_properties(dev, nd);
+            qdev_prop_set_macaddr(dev, "mac", mac.a);
+            sbd = SYS_BUS_DEVICE(dev);
+            sysbus_realize_and_unref(sbd, &error_fatal);
+            m->lance = SYSBUS_PCNET(dev);
+            m->lance->state.phys_mem_read = sun3_lance_dma_read;
+            m->lance->state.phys_mem_write = sun3_lance_dma_write;
+            memory_region_init_io(&m->lance_mr, OBJECT(machine),
+                                  &sun3_lance_ops, m, "sun3.lance", 4);
+            memory_region_add_subregion(sysmem,
+                                        SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
+                                        SUN3_OBIO_LANCE, &m->lance_mr);
+            sysbus_connect_irq(sbd, 0, m->irqs[SUN3_IRQ_SRC_LANCE]);
+        }
+    }
 
     sun3_build_idprom(m, &mac);
 }

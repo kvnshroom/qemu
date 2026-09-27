@@ -53,5 +53,6 @@ config SUN3
     depends on M68K
     select ESCC
     select ICM7170
+    select LANCE
     select NCR5380
     select SUN_BWTWO
