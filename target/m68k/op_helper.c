@@ -88,6 +88,30 @@ throwaway:
             if (!(cpu_lduw_be_mmuidx_ra(env, sp + 2, MMU_KERNEL_IDX, 0)
                   & M68K_SSW_DF_030)) {
                 env->bus_error_suppress = 1;
+                /*
+                 * Bind the suppression to the frame's own data-cycle fault
+                 * address (frame offset +8 past the format/vector word, the
+                 * "data cycle fault address" longword pushed by
+                 * do_interrupt_all()).  Without this the flag is a sticky,
+                 * global "swallow the next bus error whenever and wherever
+                 * it happens": a handler that resumes WITHOUT re-running the
+                 * access (SunOS's own bus-error-guarded peeks skip the
+                 * faulting instruction outright) leaves it armed forever,
+                 * and it then silently eats a completely unrelated later
+                 * fault.  Live example on sun3x: after a SunOS
+                 * `reboot`, the very first bus error of the next boot --
+                 * ufsboot's bus-error-guarded 16-bit peek at the absent
+                 * sun3 IDPROM location, 0xfef1cc00 -> phys 0x61000c00 -- was
+                 * swallowed, so the peek returned 0 instead of its handler's
+                 * -1, ufsboot concluded a sun3 discrete IDPROM was present
+                 * and copied it with an UNGUARDED byte loop, taking a fatal
+                 * `Error (PSR = 0x203) Timeout Bus Error ... at 0x00211A9A`
+                 * and dropping to the monitor instead of booting.  A cold
+                 * start was unaffected purely because nothing had armed the
+                 * flag yet.
+                 */
+                env->bus_error_suppress_ar =
+                    cpu_ldl_be_mmuidx_ra(env, sp + 8, MMU_KERNEL_IDX, 0);
             }
             sp += (fmt >> 12) == 0xa ? 24 : 84;
             break;
@@ -627,10 +651,16 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
             /*
              * The handler of the previous fault completed the
              * instruction with the data cycle suppressed: let the
-             * access complete as an unassigned read/write.
+             * access complete as an unassigned read/write.  Only the
+             * re-execution of that exact access qualifies (see
+             * bus_error_suppress_ar in cpu.h); anything else means the
+             * handler never re-ran the access at all, so retire the
+             * stale flag and report this fault normally.
              */
             env->bus_error_suppress = 0;
-            return;
+            if (env->bus_error_suppress_ar == (uint32_t)addr) {
+                return;
+            }
         }
         env->mmu.mmusr = 0;
         env->mmu.ssw = M68K_SSW_DF_030;
@@ -1300,7 +1330,9 @@ void HELPER(moves_chk)(CPUM68KState *env, uint32_t addr, uint32_t is_store)
     }
     if (env->bus_error_suppress) {
         env->bus_error_suppress = 0;
-        return;
+        if (env->bus_error_suppress_ar == addr) {
+            return;
+        }
     }
     moves_bus_error(env, addr, is_store, GETPC());
 }
@@ -1321,7 +1353,9 @@ uint32_t HELPER(moves_ld)(CPUM68KState *env, uint32_t addr, uint32_t size)
     }
     if (env->bus_error_suppress) {
         env->bus_error_suppress = 0;
-        return 0;
+        if (env->bus_error_suppress_ar == addr) {
+            return 0;
+        }
     }
     moves_bus_error(env, addr, false, GETPC());
     return 0;
@@ -1338,7 +1372,9 @@ void HELPER(moves_st)(CPUM68KState *env, uint32_t addr, uint32_t size,
     }
     if (env->bus_error_suppress) {
         env->bus_error_suppress = 0;
-        return;
+        if (env->bus_error_suppress_ar == addr) {
+            return;
+        }
     }
     moves_bus_error(env, addr, true, GETPC());
 }

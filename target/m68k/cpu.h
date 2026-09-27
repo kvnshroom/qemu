@@ -107,8 +107,16 @@ typedef struct CPUArchState {
     FPReg fp_result;
     uint32_t fpcr;
     uint32_t fpsr;
-    /* complete the next faulting bus access as unassigned (030 rerun) */
+    /*
+     * Complete the next faulting bus access as unassigned (68020/030 "do
+     * not rerun the faulted data cycle" rte, see m68k_rte_030_frame() and
+     * m68k_cpu_transaction_failed()).  bus_error_suppress_ar records the
+     * faulting address the suppression belongs to: the suppression must
+     * apply ONLY to the re-execution of that same access, never to some
+     * later, unrelated bus error.
+     */
     uint32_t bus_error_suppress;
+    uint32_t bus_error_suppress_ar;
     float_status fp_status;
 
     uint64_t mactmp;
