@@ -26,7 +26,15 @@
  *   0x00120000 Am7990 LANCE Ethernet (ipl 3)
  *   0x00140000 "si" NCR5380 SCSI     (ipl 2)
  *   0x001E0000 memory control (3/60 parity control, stubbed)
- *   0xFF000000 P4 bwtwo framebuffer
+ *
+ * On-board memory (type 0) above RAM:
+ *   0xFF000000 bwtwo video RAM, 128KB mirrored in a 256KB window
+ *              (1152x900x1, MSB first, 1 = black; display enable is
+ *              the system enable register's VIDEO bit, the vertical
+ *              retrace interrupt is the interrupt register's VIDEO bit,
+ *              level 4)
+ *   0xFF1C0000 bwtwo resolution ID byte (bit 7 set = 1152x900)
+ *   0xFF600000 the boot EPROM again
  *
  * Accesses that decode to nothing latch the TIMEOUT bit in the bus
  * error register and terminate in a bus error, which is how the PROM
@@ -216,12 +224,30 @@
 /*
  * 3/60 on-board devices in the high type-0 (obmem) space, from the
  * monitor's device map table at ROM offset 0xD350:
- * 0xFF000000 video RAM (the monitor also runs its early stack here),
+ * 0xFF000000 video RAM (the monitor maps and clears a 256KB window at
+ *            VA 0x0FE20000; the bwtwo carries 128KB, mirrored),
+ * 0xFF1C0000 the bwtwo resolution ID byte: bit 7 set = 1152x900, clear
+ *            = the 1600x1280 hi-res option.  The PROM's bwtwo probe
+ *            (0xfef25a2) peeks it with a byte read and only stores its
+ *            width/height variables when the peek succeeds -- with a
+ *            bus error there they stay 0 and the console draws with a
+ *            zero line stride (observed: screen_y advanced, VRAM empty),
+ *            so the byte exists on every 3/60.  NetBSD bw2attach and
+ *            SunOS bwtwoprobe peek the same byte, falling back to
+ *            1152x900 on a bus error.
  * 0xFF600000 the boot EPROM again (128KB window, ROM mirrored).
  */
 #define SUN3_OBMEM_VRAM         0xFF000000
-#define SUN3_OBMEM_VRAM_SIZE    (256 * KiB)
+#define SUN3_OBMEM_VRAM_SIZE    (128 * KiB)
+#define SUN3_OBMEM_BW2_ID       0xFF1C0000
+#define SUN3_BW2_ID_1152X900    0x80    /* only bit 7 is decoded */
 #define SUN3_OBMEM_EPROM        0xFF600000
+/*
+ * Vertical retrace rate of the 1152x900 monitor.  Only the interrupt
+ * register's VIDEO_ENAB bit gates it (SunOS bwtwointr acks by clearing
+ * that bit; the PROM and NetBSD never enable it).
+ */
+#define SUN3_VIDEO_HZ           67
 
 #define SUN3_ROM_SIZE           (64 * KiB)
 #define SUN3_EEPROM_SIZE        (2 * KiB)
@@ -237,7 +263,7 @@
 #define SUN3_IREG_SOFT_1        0x02
 #define SUN3_IREG_SOFT_2        0x04
 #define SUN3_IREG_SOFT_3        0x08
-#define SUN3_IREG_VIDEO_ENAB    0x10
+#define SUN3_IREG_VIDEO_ENAB    0x10    /* level-4 vertical retrace */
 #define SUN3_IREG_CLOCK_ENAB_5  0x20
 #define SUN3_IREG_CLOCK_ENAB_7  0x80    /* the monitor runs on 0x81 */
 
@@ -288,7 +314,6 @@ struct Sun3MachineState {
     MemoryRegion type_bg[SUN3_NUM_TYPES];
     MemoryRegion rom;
     MemoryRegion rom_obmem[2];  /* the EPROM again at obmem 0xFF600000 */
-    MemoryRegion vram;
     MemoryRegion eeprom;
     MemoryRegion intreg_mr;
     MemoryRegion memerr_mr;
@@ -339,6 +364,14 @@ struct Sun3MachineState {
      */
     bool clock_latch[8];        /* board latches fed by the ICM7170 INT pin */
 
+    /* on-board bwtwo */
+    DeviceState *bwtwo;
+    MemoryRegion bw2_id_mr;
+    qemu_irq video_enable;      /* the bwtwo's display enable input */
+    bool video_latch;           /* vertical retrace seen while enabled */
+    QEMUTimer video_timer;
+    bool console_fb;            /* "sunos-console": EEPROM byte 0x1F */
+
     /* memory error (parity) registers */
     uint8_t memerr_csr;
     GHashTable *parity_poison;  /* physical addresses holding bad parity */
@@ -377,6 +410,9 @@ static void sun3_irq_update(Sun3MachineState *m)
     if (m->clock_latch[SUN3_IPL_CLOCK_NMI] &&
         (m->intreg & SUN3_IREG_CLOCK_ENAB_7)) {
         pend |= 1 << SUN3_IPL_CLOCK_NMI;
+    }
+    if (m->video_latch && (m->intreg & SUN3_IREG_VIDEO_ENAB)) {
+        pend |= 1 << SUN3_IPL_VIDEO;
     }
     if (!(m->intreg & SUN3_IREG_ALL_ENAB)) {
         pend = 0;
@@ -418,6 +454,24 @@ static void sun3_clock_irq(void *opaque, int n, int level)
     sun3_irq_update(m);
 }
 
+/*
+ * Video (vertical retrace) interrupt, level 4: latched once per frame
+ * while the interrupt register's VIDEO_ENAB bit is set, cleared by
+ * clearing that bit (SunOS bwtwointr, locore 0xe004cf6).
+ */
+static void sun3_video_timer_cb(void *opaque)
+{
+    Sun3MachineState *m = opaque;
+
+    if (!(m->intreg & SUN3_IREG_VIDEO_ENAB)) {
+        return;
+    }
+    m->video_latch = true;
+    sun3_irq_update(m);
+    timer_mod(&m->video_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / SUN3_VIDEO_HZ);
+}
+
 static uint64_t sun3_intreg_read(void *opaque, hwaddr addr, unsigned size)
 {
     Sun3MachineState *m = opaque;
@@ -436,6 +490,13 @@ static void sun3_intreg_write(void *opaque, hwaddr addr, uint64_t val,
     }
     if (!(val & SUN3_IREG_CLOCK_ENAB_7)) {
         m->clock_latch[SUN3_IPL_CLOCK_NMI] = false;
+    }
+    if (!(val & SUN3_IREG_VIDEO_ENAB)) {
+        m->video_latch = false;
+        timer_del(&m->video_timer);
+    } else if (!(m->intreg & SUN3_IREG_VIDEO_ENAB)) {
+        timer_mod(&m->video_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / SUN3_VIDEO_HZ);
     }
     m->intreg = val;
     sun3_irq_update(m);
@@ -815,6 +876,7 @@ static bool sun3_control_space(Sun3MachineState *m, vaddr addr, unsigned size,
                           (uint8_t)*val);
             m->enable = *val;
             tlb_flush(CPU(m->cpu));
+            qemu_set_irq(m->video_enable, !!(m->enable & SUN3_ENA_VIDEO));
         } else {
             *val = m->enable;
         }
@@ -1358,6 +1420,23 @@ static void sun3_build_idprom(Sun3MachineState *m, const MACAddr *mac)
     p[15] = sum;
 }
 
+/* --- on-board bwtwo resolution ID byte --- */
+
+static uint64_t sun3_bw2_id_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return SUN3_BW2_ID_1152X900;
+}
+
+static const MemoryRegionOps sun3_bw2_id_ops = {
+    .read = sun3_bw2_id_read,
+    .write = sun3_zero_write,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
 /* --- machine --- */
 
 static void sun3_machine_reset(void *opaque)
@@ -1375,6 +1454,9 @@ static void sun3_machine_reset(void *opaque)
     m->intreg = 0;
     m->irq_sources = 0;
     memset(m->clock_latch, 0, sizeof(m->clock_latch));
+    m->video_latch = false;
+    timer_del(&m->video_timer);
+    qemu_set_irq(m->video_enable, 0);
     m->memerr_csr = 0;
     if (m->parity_poison) {
         g_hash_table_remove_all(m->parity_poison);
@@ -1453,12 +1535,28 @@ static void sun3_init(MachineState *machine)
                                     &m->rom_obmem[i]);
     }
 
-    /* on-board video RAM (also the monitor's early work RAM/stack) */
-    memory_region_init_ram(&m->vram, NULL, "sun3.vram",
-                           SUN3_OBMEM_VRAM_SIZE, &error_fatal);
+    /*
+     * On-board bwtwo: 128KB of video RAM at obmem 0xFF000000, mirrored
+     * to fill the 256KB window the PROM maps (and clears); the display
+     * enable is driven from the system enable register's VIDEO bit
+     * (see hw/display/sun-bwtwo.c, "the on-board Sun-3/60 variant").
+     */
+    m->bwtwo = qdev_new("sun-bwtwo");
+    qdev_prop_set_bit(m->bwtwo, "p4", false);
+    sbd = SYS_BUS_DEVICE(m->bwtwo);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, SUN3_TYPE_SPACE(SUN3_TYPE_OBMEM) +
+                            SUN3_OBMEM_VRAM);
+    sysbus_mmio_map(sbd, 1, SUN3_TYPE_SPACE(SUN3_TYPE_OBMEM) +
+                            SUN3_OBMEM_VRAM + SUN3_OBMEM_VRAM_SIZE);
+    m->video_enable = qdev_get_gpio_in_named(m->bwtwo, "video-enable", 0);
+    timer_init_ns(&m->video_timer, QEMU_CLOCK_VIRTUAL,
+                  sun3_video_timer_cb, m);
+    memory_region_init_io(&m->bw2_id_mr, OBJECT(machine), &sun3_bw2_id_ops,
+                          m, "sun3.bw2-id", 1);
     memory_region_add_subregion(sysmem,
                                 SUN3_TYPE_SPACE(SUN3_TYPE_OBMEM) +
-                                SUN3_OBMEM_VRAM, &m->vram);
+                                SUN3_OBMEM_BW2_ID, &m->bw2_id_mr);
 
     /* EEPROM (configuration store; zeroed => PROM falls back to defaults) */
     memory_region_init_ram(&m->eeprom, NULL, "sun3.eeprom",
@@ -1466,9 +1564,15 @@ static void sun3_init(MachineState *machine)
     memory_region_add_subregion(sysmem,
                                 SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
                                 SUN3_OBIO_EEPROM, &m->eeprom);
-    /* console on ttya until there is a display+keyboard to talk to */
+    /*
+     * Byte 0x1F selects the console: 0x00 = screen + keyboard (the PROM
+     * then probes the bwtwo and the keyboard and sets its romvec
+     * inSource/outSink to 0, which SunOS's consconfig() follows), 0x10 =
+     * ttya.  The "sunos-console" machine property chooses; ttya is the
+     * default so serial-driven runs are unchanged.
+     */
     ((uint8_t *)memory_region_get_ram_ptr(&m->eeprom))[SUN3_EEPROM_CONSOLE] =
-        SUN3_EEPROM_CONS_TTYA;
+        m->console_fb ? SUN3_EEPROM_CONS_BW : SUN3_EEPROM_CONS_TTYA;
 
     /* interrupt register and glue */
     m->irqs = qemu_allocate_irqs(sun3_set_irq, m, SUN3_IRQ_NUM_SRCS);
@@ -1523,18 +1627,24 @@ static void sun3_init(MachineState *machine)
     qemu_irq_raise(qdev_get_gpio_in_named(dev, "dcd", 1));
 
     /*
-     * zs1: keyboard/mouse.  Left as plain unconnected serial channels
-     * for now: the PROM finds no keyboard and selects the ttya
-     * console.  (Switch to escc_kbd/escc_mouse along with the bwtwo.)
+     * zs1: Sun keyboard on channel A (csr +4, data +6; the PROM's
+     * keyboard init at 0xfef3fb2 programs it for 1200 baud and sends
+     * the reset command 0x01 until the 0xFF <id> reply arrives, then
+     * records the id in its romvec keyBid), mouse on channel B.  Same
+     * escc_kbd/escc_mouse channel types and PCLK as sun4m and sun3x;
+     * the keyboard answers as a Type 4 with layout 0 (US), which is
+     * what SunOS 4.1.1's OpenWindows 2.0 accepts.  Idle under
+     * -nographic, like sun3x.
      */
     dev = qdev_new(TYPE_ESCC);
-    qdev_prop_set_uint32(dev, "disabled", 0);
+    qdev_prop_set_uint32(dev, "disabled", !machine->enable_graphics);
     qdev_prop_set_uint32(dev, "frequency", SUN3_ZS_FREQ);
     qdev_prop_set_uint32(dev, "it_shift", 1);
     qdev_prop_set_chr(dev, "chrA", NULL);
     qdev_prop_set_chr(dev, "chrB", NULL);
-    qdev_prop_set_uint32(dev, "chnAtype", escc_serial);
-    qdev_prop_set_uint32(dev, "chnBtype", escc_serial);
+    qdev_prop_set_uint32(dev, "chnAtype", escc_kbd);
+    qdev_prop_set_uint32(dev, "chnBtype", escc_mouse);
+    qdev_prop_set_string(dev, "chnA-sunkbd-layout", "0");
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
@@ -1577,6 +1687,29 @@ static void sun3_init(MachineState *machine)
     sun3_build_idprom(m, &mac);
 }
 
+static char *sun3_get_sunos_console(Object *obj, Error **errp)
+{
+    Sun3MachineState *m = SUN3_MACHINE(obj);
+
+    return g_strdup(m->console_fb ? "fb" : "ttya");
+}
+
+static void sun3_set_sunos_console(Object *obj, const char *value,
+                                   Error **errp)
+{
+    Sun3MachineState *m = SUN3_MACHINE(obj);
+
+    if (!strcmp(value, "ttya")) {
+        m->console_fb = false;
+    } else if (!strcmp(value, "fb")) {
+        m->console_fb = true;
+    } else {
+        error_setg(errp,
+                   "Invalid sunos-console value '%s': must be 'ttya' or 'fb'",
+                   value);
+    }
+}
+
 static void sun3_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1587,6 +1720,13 @@ static void sun3_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_size = 16 * MiB;
     mc->default_ram_id = "sun3.ram";
     mc->max_cpus = 1;
+
+    object_class_property_add_str(oc, "sunos-console",
+                                  sun3_get_sunos_console,
+                                  sun3_set_sunos_console);
+    object_class_property_set_description(oc, "sunos-console",
+        "Console selected by EEPROM byte 0x1F: 'ttya' (default, serial) "
+        "or 'fb' (on-board bwtwo screen + Sun keyboard/mouse).");
 }
 
 static const TypeInfo sun3_machine_typeinfo = {
