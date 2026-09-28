@@ -1,7 +1,7 @@
 # QEMU `-M sun3-60`: the Sun-3/60 hardware contract
 
 The Sun-3/60 ("Ferrari") is a 20 MHz 68020 with the discrete Sun-3 MMU (8 contexts, segment map, 256 PMEGs of 16 8 KiB pages), zs serial/keyboard/mouse, an ICM7170 clock, an on-board 1152x900 bwtwo, the "si" NCR5380+Am9516 SCSI and an Am7990 LANCE; the model is `hw/m68k/sun3.c` plus the board hooks in `target/m68k` (`m68k_set_fc_ops`).
-What it boots today: the genuine 3.60 v3.0.1 PROM to the `>` monitor on ttya or on its own screen with the Type-4 keyboard; NetBSD/sun3 1.5.2 RAMDISK by gdbstub injection and the INSTALL kernel from a miniroot disk; Linux/m68k sun3 (7.3.0-rc4 branch) by injection to a shell; SunOS 4.1.1/sun3 MINIROOT from disk and an installed GENERIC system to multi-user `login:` with SunView and OpenWindows 2.0 on the screen and networking through `le0`.
+What it boots today: the genuine 3.60 v3.0.1 PROM to the `>` monitor on ttya or on its own screen with the Type-4 keyboard; NetBSD/sun3 1.5.2 RAMDISK by gdbstub injection and the INSTALL kernel from a miniroot disk; Linux/m68k sun3 (7.3.0-rc4 branch) to a shell natively from `-kernel`, from a boot disk through the genuine PROM (`sun3-tools/bootloader/`) or by injection; SunOS 4.1.1/sun3 MINIROOT from disk and an installed GENERIC system to multi-user `login:` with SunView and OpenWindows 2.0 on the screen and networking through `le0`.
 Every register, bit and address below was cross-checked against the code named above; the evidence pointers (ROM offsets, kernel symbols) say where each fact was read from, and bracketed session numbers point at the old journals.
 The session journals this file was distilled from (SUN3-NOTES.md at the top level of the old tree) are preserved in branch `sun3-history`.
 Companion files: `sun3-tools/` (boot drivers, the install recipe in `install/INSTALL-LOG.md`, evidence logs and screenshots in `logs/`).
@@ -375,12 +375,34 @@ interrupt register and IDPROM built for NetBSD suffice. The kernel-side contract
   reserves PMEG 247 for the ROM and copies the ROM/IO maps into every context).
 * **Load/entry**: `KERNBASE` 0x0E000000, link at 0x0E002000; `sun3-head.S` runs at the physical
   copy through the monitor's low identity map, copies the segmaps from VA 0 up to KERNBASE until
-  the first invalid PMEG (0xFF), then jumps high. `boot-linux.py` loads each PT_LOAD at `p_vaddr
-  - 0x0E000000`, zeroes the BSS tail (`sun3-head.S` never does), appends a minimal bootinfo
-  (`BI_MACHTYPE = MACH_SUN3`, `BI_LAST`) at `_end` (`setup_arch()` NULL-derefs without one) and
-  runs `g 2000`.
+  the first invalid PMEG (0xFF), then jumps high. A loader puts each PT_LOAD at `p_vaddr -
+  0x0E000000`, zeroes the BSS tail (`sun3-head.S` never does), appends a bootinfo at `_end`
+  (`setup_arch()` NULL-derefs without one) and enters at `e_entry - KERNBASE` = 0x2000 with the
+  MMU on in context 0. Only `BI_MACHTYPE = MACH_SUN3` is consumed: `config_sun3()` takes the
+  memory size from `pv_sun3mem` (BI_MEMCHUNK is overwritten), `CONFIG_BOOTPARAM_STRING`
+  ("console=hvc0" in `sun3-linux.config`) replaces BI_COMMAND_LINE, BI_RAMDISK is generic
+  (`CONFIG_BLK_DEV_INITRD=y`: an external initramfs is unpacked). Three loaders do this:
+  * **`-kernel` without `-bios`** (`sun3_load_kernel()` / `sun3_build_prom()` /
+    `sun3_kernel_boot_maps()`): no PROM image at all. The 64 KiB EPROM region holds a synthesised
+    PROM: the romvec at offset 0 (= VA 0x0FEF0000, as in the genuine ROM) with `pv_sun3mem`,
+    `pv_memoryavail`, `pv_monid` "QEMU", `pv_romvers` 2 and hand-assembled stubs for
+    putchar/getchar (ttya through the PROM's zs page VA 0x0FE02004/6, enabling WR5.TXEN / WR3.RXEN
+    themselves), halt/reboot (`bra .`) and `pv_setctxt`, transcribed from the ROM's setcxsegmap
+    (0x0AC8: DFC = 3, clear NOTBOOT so that the stub's own fetches are redirected to the EPROM
+    while the other context is selected, switch, store, switch back, restore). Reset preloads the
+    maps the kernel expects: RAM identity-mapped with PMEG n = physical segment n (the monitor
+    maps 8 MB; here all of RAM), the PROM's device pages in PMEG 254 at 0x0FE00000 (map table
+    below), the EPROM in PMEG 247 at 0x0FEF0000, every other segment 0xFF; enable register
+    NOTBOOT|SDVMA; PC = 0x2000. `-initrd` is loaded two pages below the top of RAM (BI_RAMDISK),
+    `-append` becomes BI_COMMAND_LINE. Unlike sun3x's path (MMU off, PAGE_OFFSET 0, head.S copies
+    the PROM's page table) no code of ours runs before the kernel: the boot state is pure MMU
+    data. `-bios` with `-kernel` is refused.
+  * **The boot disk** (`sun3-tools/bootloader/`, section 15b): the genuine PROM's `b sd(0,0,0)`
+    loads an 8 KiB boot block which loads the kernel through the PROM's own disk driver.
+  * **Injection** (`sun3-tools/boot-linux.py`): gdbstub writes at the `>` prompt, then `g 2000`.
 * **The 8 MB budget**: the monitor identity-maps only the low 8 MB (reads through 0x7FE000,
-  fault at 0x800000); the injected image must fit (trimmed kernel + initramfs, about 4 MB).
+  fault at 0x800000); an injected or disk-loaded image must fit (trimmed kernel + initramfs,
+  about 4 MB; the boot block itself sits at 0x780000). The `-kernel` path maps all of RAM.
 * **IDPROM**: `id_machtype` 0x17, `id_format` 0x01, XOR checksum -- section 13.
 * Kernel deltas on the Linux `sun3` branch (master + 6 commits): memblock registration with
   `min_low_pfn`/`max_low_pfn` and bottom-up allocation, a PROM early console, `ELF_ET_DYN_BASE`
@@ -391,6 +413,64 @@ interrupt register and IDPROM built for NetBSD suffice. The kernel-side contract
   smolsh (`sun3-tools/logs/linux-sun3-60.log`). Known: the guest wall clock runs several times
   fast (100 Hz ICM7170 tick vs `legacy_timer_tick`, cosmetic), and a sporadic spurious SIGUSR1
   seen with the earlier busybox initramfs was never root-caused.
+
+## 15b. The PROM's boot-block interface (evidence for `sun3-tools/bootloader/`)
+
+Read from the 3.60 v3.0.1 ROM (`objdump -D -b binary -m m68k:68020 --adjust-vma=0x0fef0000`)
+and from the two working boot blocks on disks at hand: NetBSD's `bootxx` (miniroot.gz, sectors
+1..10, 4728 bytes) and SunOS's `bootsd` (sun3-installed-gfx.img, sectors 1..9, 4404 bytes,
+written by `installboot`); both disassembled with `--adjust-vma=0x4000`.
+
+* **Dispatcher** (`b dev(c,u,p) file args`, ROM 0x5A00..0x5D7E): fills the bootparam block in
+  globram (0xFFFFE21C; `romvec+12` points at a pointer to it): `argPtr[8]`@0, `strings[100]`@32,
+  `devName[2]`@132, `ctlrNum`@134, `unitNum`@138, `partNum`@142, `fileName`@146, `bootDevice`@150
+  (the device's boottab). Builds a saioreq on its stack, calls `b_probe`, then the generic
+  `b_boot` (0x5E98): `si_bn = 1, si_cc = d_maxiobytes (8192), si_ma = 0x4000, b_strategy(si, 1)`,
+  checks the count and returns 0x4000, which the caller jumps to ("Boot: load failed" otherwise).
+  So a boot block is **sectors 1..16 of the partition, at most 8 KiB, entered by `jmp 0x4000`
+  in supervisor mode**, with the monitor's maps and stack, nothing in registers: `bootxx` and
+  `bootsd` both re-open the device through `bootParam->bootDevice`.
+* **Tables** (2-byte packed, Sun cc): boottab `{b_dev[2]@0, b_probe@2, b_boot@6, b_open@10,
+  b_close@14, b_strategy@18, b_desc@22, b_devinfo@26}` (sd: ROM 0xDB94); devinfo
+  `{d_devbytes, d_dmabytes, d_localbytes, d_stdcount, d_stdaddrs, d_devtype, d_maxiobytes}`
+  (sd: 0, 0x2020, 0x2C, 1, [0], 0, 0x2000); saioreq `{si_flgs@0, si_boottab@2, si_devdata@6,
+  si_ctlr@10, si_unit@14, si_boff@18, si_cyloff@22, si_offset@26, si_bn@30, si_ma@34, si_cc@38,
+  si_sif@42, si_devaddr@46, si_dmaaddr@50}`.
+* **The caller provides the buffers**: `si_devdata` (d_localbytes, zeroed by the driver),
+  `si_dmaaddr` (d_dmabytes: 8 KiB of data + the UDC chain table at +0x2000), `si_devaddr` for
+  devices with d_devbytes (sd has none: the ROM's si driver uses the monitor's own page at
+  0x0FE12000). `bootsd`'s `alloc(type, n)`: 0 = RAM from 0x200000 up, 1 = DVMA VA from
+  0xFFF00000 up, 2 = DVMA VA mapped by page-map writes to pages taken downward from
+  `(*memoryavail >> 13) - 1`; its `dev_mapin(type, addr, len)` writes PTEs `0xF0000000 | type
+  << 26 | pfn`. `bootxx`'s `dvma_init` copies the segment map of 0x200000..0x2DFFFF (where it
+  runs) over 0x0FF00000..0x0FFDFFFF, so DVMA address 0xF00000 + x is its own RAM.
+* **sd `b_open`** (0x8576): target = unit >> 3, LUN = unit & 7, TEST UNIT READY, START UNIT,
+  reads sector 0 into si_dmaaddr, validates the label (0x7002: "No label found - attempting boot
+  anyway"), `si_cyloff = part[si_boff].start_cyl * ntrks * nsect`. Returns -1 on failure.
+* **sd `b_strategy(si, rw)`** (0x866C -> 0x86A4): READ6 (rw 2 = WRITE) for `(si_cc + 511) / 512`
+  sectors, **adds si_cyloff into si_bn in place**, DMAs into si_dmaaddr through its 24-bit DVMA
+  address (`va & 0xFFFFFF`, section 11: translated as VA 0x0F000000 | addr in the current
+  context), then `bcopy(si_dmaaddr, si_ma, si_cc)` when they differ. Returns the (rounded) byte
+  count, 0 on error: ask for whole sectors.
+* **State at entry** (maps dumped with `-d int` at the `>` prompt): context 0; VA 0..0x7FFFFF ->
+  PMEG 0..0x3F identity (PTE 0xD000xxxx: VALID|WRITE|NC, no SYSTEM); 0x0FE00000 PMEG 0xFE (device
+  pages), 0x0FE20000/0x0FE40000 0xFD/0xFC (VRAM), 0x0FE60000 0xFB (page 0 = the top RAM page:
+  the PROM stack and, via `movec %sp,%vbr` at 0x01A6/0xAB8C, its vector table -- low RAM is free),
+  0x0FEA0000 0xF9 (EPROM copy), 0x0FEE0000 0xF7 (ROM in pages 8..15), 0x0FF00000..0x0FF7FFFF
+  0xF6..0xF3 (the PROM's DVMA area, 0xF6 pages 0..2 = top RAM pages), 0x0FFE0000 0xF8 (globram in
+  page 15); all 8 contexts written alike. Both example blocks start with `move.w #0x2700,%sr` and
+  copy themselves from 0x4000 to 0x240000 before loading anything.
+* **Our block** (`bootloader/entry.S`, `boot.c`, 1.6 KB): copies itself to 0x780000, re-opens the
+  device from bootparam, `segmap[0x0FF00000] := segmap[0x780000]` (the bootxx trick) so that
+  `si_dmaaddr = 0x0FF00000 + (dmabuf - 0x780000)`, reads the header sector 17 (magic `SUN3LNX1`,
+  entry, up to 30 segments of {sector, bytes, physical destination}) and the segments in 8 KiB
+  strategy calls, restores the segment map, `b_close`, `jmp entry`. `mk-bootdisk.py` writes the
+  label (install/mk-sun3-disks.py), the block, the header and the flattened kernel (+ initrd,
+  + command line) from sector 32. Result: `Boot: sd(0,0,0)` -> `Linux/sun3 boot: sd(0,0,0),
+  memory 24 MB` -> smolsh, `PROM Revision: 3.0.1` (`sun3-tools/logs/linux-sun3-60-bootdisk.log`;
+  typed `b sd(0,8,0)` with the disk at unit 1 in `-bootdisk-typed.log`). Not chased: loading
+  NetBSD's kernel with it (the block loads any segment list, but the NetBSD kernel wants its
+  own a.out entry state).
 
 ## 16. How to run / verify
 
@@ -406,6 +486,19 @@ qemu-system-m68k`. ROM: `3.60_v3.0.1_rom` (64 KiB, `-bios`).
       SUN3_GDBPORT=11354 SUN3_EXTRA="-m 24M" SUN3_PROMPT="smolsh / > " \
       SUN3_CMDS="uname -a; cat /proc/cpuinfo" python3 sun3-tools/boot-linux.py /tmp/sun3-linux.log
     # -> sun3-tools/logs/linux-sun3-60.log
+
+    # Linux/sun3 natively, no PROM image (-append -> BI_COMMAND_LINE, overridden by CONFIG_BOOTPARAM;
+    # -initrd -> BI_RAMDISK below the top of RAM)
+    qemu-system-m68k -M sun3-60 -m 24M -kernel /tmp/sun3-kbuild/vmlinux -display none -serial mon:stdio
+    # -> sun3-tools/logs/linux-sun3-60-kernel.log (PROM Revision: QEMU)
+
+    # Linux/sun3 from a boot disk through the genuine PROM (sun3-tools/bootloader/)
+    make -C sun3-tools/bootloader CROSS=m68k-linux-gnu-        # bootblk.bin, 1.6 KB
+    python3 sun3-tools/bootloader/mk-bootdisk.py --out /tmp/boot.img [--initrd F] [--append "..."] vmlinux
+    qemu-system-m68k -M sun3-60 -m 24M -bios 3.60_v3.0.1_rom -display none -serial mon:stdio \
+      -drive file=/tmp/boot.img,format=raw,if=scsi,bus=0,unit=0
+    # -> auto-boot "Boot: sd(0,0,0)", "Linux/sun3 boot: ...", smolsh (logs/linux-sun3-60-bootdisk.log);
+    #    at unit 1: `b sd(0,8,0)` at the > prompt (logs/linux-sun3-60-bootdisk-typed.log)
 
     # NetBSD 1.5.2 RAMDISK injection (SUN3_QEMU, SUN3_ROM, SUN3_KERNEL=netbsd.RAMDISK,
     # SUN3_GDBPORT, SUN3_TIMEOUT, SUN3_EXTRA); loads at physical 0x4000, `g 4000`

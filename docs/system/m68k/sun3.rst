@@ -58,8 +58,10 @@ Firmware
 
 ``-bios`` (default name ``3.60_v3.0.1_rom``) takes the 64KB Sun-3/60 boot
 PROM v3.0.1 (27C512 image, md5 ``28597f8a7f59b44395a398e152203505``, from the
-``sunshack_bootroms`` collection on archive.org).  The machine does not start
-without it; there is no ``-kernel`` path on the 3/60.
+``sunshack_bootroms`` collection on archive.org).  Without ``-bios`` the
+machine needs ``-kernel``: a Linux/sun3 ELF is then started directly with a
+synthesised PROM vector (see `Booting Linux`_); the two options exclude each
+other.
 
 Machine options
 ^^^^^^^^^^^^^^^
@@ -184,9 +186,50 @@ tree carrying ``sun3-tools/linux-sun3.patch`` (the ``hvc_sun3`` console driver
 and an ``ELF_ET_DYN_BASE`` inside the 3/60's 28-bit user address space), with
 the built-in initramfs described in ``sun3-tools/initramfs/README.md`` (a
 static, non-LTO smolutils userland linked at 0x04000000 with 8KB page
-alignment).  As the 3/60 has no ``-kernel`` path,
-``sun3-tools/boot-linux.py`` injects the ELF segments through the gdbstub at
-the monitor prompt and starts the kernel with ``g``:
+alignment).  Give it 24MB and boot it in one of three ways.
+
+**Natively with** ``-kernel`` (no PROM image needed):
+
+.. code-block:: shell
+
+   qemu-system-m68k -M sun3-60 -m 24M -kernel vmlinux -display none -serial mon:stdio
+
+The machine loads the ELF where the kernel expects it (``p_vaddr -
+0x0E000000``, BSS zeroed, a bootinfo block at ``_end``), preloads the MMU
+with the maps a Sun boot program leaves (RAM identity-mapped, the PROM's
+device pages at ``0x0FE00000``, the PROM at ``0x0FEF0000``) and stands in
+for the PROM with a synthesised vector table -- the kernel keeps calling the
+PROM for its console and for ``pv_setctxt``, so ``/proc/hardware`` shows
+``PROM Revision: QEMU``.  ``-initrd`` is passed as ``BI_RAMDISK`` (unpacked
+as an external initramfs); ``-append`` becomes ``BI_COMMAND_LINE`` but the
+supplied configuration pins ``console=hvc0`` with ``CONFIG_BOOTPARAM``, which
+takes precedence.  ``-bios`` cannot be combined with ``-kernel``.
+
+**From a disk through the genuine PROM**, the way the hardware did it.
+``sun3-tools/bootloader/`` is a Linux boot block for the Sun-3 PROM's disk
+boot (the PROM reads 8KB from sector 1 of the partition to ``0x4000`` and
+jumps there; the block re-opens the boot device through the PROM's
+``bootparam``/``boottab`` interface, reads the kernel with the PROM's own
+``b_strategy`` and jumps to it), and ``mk-bootdisk.py`` builds the disk:
+
+.. code-block:: shell
+
+   make -C sun3-tools/bootloader CROSS=m68k-linux-gnu-
+   python3 sun3-tools/bootloader/mk-bootdisk.py --out boot.img \
+     [--initrd initrd.cpio] [--append "..."] vmlinux
+   qemu-system-m68k -M sun3-60 -m 24M -bios 3.60_v3.0.1_rom -display none \
+     -serial mon:stdio -drive file=boot.img,format=raw,if=scsi,bus=0,unit=0
+
+The PROM auto-boots ``sd(0,0,0)`` (or type ``b sd(0,0,0)`` at ``>``; a disk
+at unit 1 is ``b sd(0,8,0)``), prints ``Linux/sun3 boot: sd(0,0,0), memory
+24 MB``, loads the image with a dot per 256KB and starts the kernel; the
+whole image must fit below ``0x780000``, where the boot block runs.  The disk
+holds a Sun label, the boot block, a header in sector 17 and the flattened
+kernel from sector 32 (format in ``mk-bootdisk.py``).
+
+**By injection** (the original method): ``sun3-tools/boot-linux.py`` writes
+the ELF segments through the gdbstub at the monitor prompt and starts the
+kernel with ``g``:
 
 .. code-block:: shell
 
@@ -196,7 +239,8 @@ the monitor prompt and starts the kernel with ``g``:
      python3 sun3-tools/boot-linux.py /tmp/sun3-linux.log
 
 ``SUN3_PROMPT``, ``SUN3_CMDS`` and ``SUN3_TIMEOUT`` drive the session once
-``smolsh`` is up; ``/proc/cpuinfo`` reports a 68020 with the Sun-3 MMU.
+``smolsh`` is up.  In all three cases ``/proc/cpuinfo`` reports a 68020 with
+the Sun-3 MMU.
 
 Booting SunOS 4.1.1/sun3
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -480,6 +524,9 @@ File                         Purpose
 ===========================  ===================================================
 ``boot-netbsd-ramdisk.py``   Inject the NetBSD 1.5.2 RAMDISK kernel via gdbstub.
 ``boot-linux.py``            Inject a Linux/sun3 ELF kernel, drive the shell.
+``bootloader/``              Linux boot block for the PROM's disk boot
+                             (``boot.c``, ``entry.S``, ``Makefile``) and
+                             ``mk-bootdisk.py``, the boot-disk builder.
 ``boot-sunos-installed.py``  Boot an installed SunOS disk to ``login:``, run
                              commands, ``sync; reboot`` or ``--halt``.
 ``hmp.py``                   HMP helper: ``sendkey`` typing, mouse, screendump.
@@ -489,9 +536,10 @@ File                         Purpose
 ``initramfs/``               gen_init_cpio manifest, ``init.c``, smolutils recipe.
 ``install/``                 ``mk-sun3-disks.py``, ``install-drive.py``,
                              ``cmds_stage*.py``, ``INSTALL-LOG.md``.
-``logs/``                    One transcript per OS (Linux, NetBSD miniroot,
-                             SunOS installed and networked) and the
-                             ``sun3-60-*.png`` screenshots.
+``logs/``                    One transcript per OS and boot path (Linux
+                             injected, ``-kernel`` and from the boot disk,
+                             NetBSD miniroot, SunOS installed and networked)
+                             and the ``sun3-60-*.png`` screenshots.
 ===========================  ===================================================
 
 ``sun3x-tools/`` (Sun 3/80):
