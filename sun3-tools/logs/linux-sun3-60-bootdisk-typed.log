@@ -1,0 +1,79 @@
+Timeout Bus Error:
+  Vaddr: 0FE64003, Paddr: 00120003, Type 1, Read, FC 5, Size 4 at 0x0FEF75F4.
+>b sd(0,8,0)
+Boot: sd(0,8,0) 
+
+Linux/sun3 boot: sd(0,8,0), memory 24 MB
+  0x00000000 <- sector 32, 3976160 bytes ...............
+Linux/sun3 boot: entry 0x00002000
+Linux version 7.3.0-rc4-sun3 (dev@claustrum) (m68k-linux-gnu-gcc (GCC) 14.3.0, GNU ld (GNU Binutils) 2.44) #1 Mon Sep 28 02:04:19 UTC 2026
+Saving 34 bytes of bootinfo
+printk: legacy bootconsole [sun3prom0] enabled
+ARCH: SUN3
+TYPE: Sun 3/60
+Ethernet address: 08:00:20:36:00:60
+mapped: vaddr=fe00000 [fe] pte=d7000000 [0000000 vw-xam io]
+mapped: vaddr=fe20000 [fd] pte=d007f800 [ff000000 vw-x-- memory]
+mapped: vaddr=fe40000 [fc] pte=d007f810 [ff020000 vw-x-- memory]
+mapped: vaddr=fe60000 [fb] pte=d3000bff [17fe000 vw-xam memory]
+mapped: vaddr=fe80000 [fa] pte=20000000 [0000000 --s--- memory]
+mapped: vaddr=fea0000 [f9] pte=d007fb00 [ff600000 vw-x-- memory]
+mapped: vaddr=fee0000 [f7] pte=f0000f70 [1ee0000 vwsx-- memory]
+mapped: vaddr=ff00000 [f6] pte=f3000bfd [17fa000 vwsxam memory]
+mapped: vaddr=ff20000 [f5] pte=f0000f50 [1ea0000 vwsx-- memory]
+mapped: vaddr=ff40000 [f4] pte=f0000f40 [1e80000 vwsx-- memory]
+mapped: vaddr=ff60000 [f3] pte=f0000f30 [1e60000 vwsx-- memory]
+mapped: vaddr=ffe0000 [f8] pte=f0000f80 [1f00000 vwsx-- memory]
+Zone ranges:
+  DMA      [mem 0x0000000000000000-0x00000000017fbfff]
+  Normal   empty
+Movable zone start for each node
+Early memory node ranges
+  node   0: [mem 0x0000000000000000-0x00000000017fbfff]
+Initmem setup node 0 [mem 0x0000000000000000-0x00000000017fbfff]
+Kernel command line: console=hvc0
+printk: log buffer data + meta data: 65536 + 204800 = 270336 bytes
+Dentry cache hash table entries: 4096 (order: 1, 16384 bytes, linear)
+Inode-cache hash table entries: 2048 (order: 0, 8192 bytes, linear)
+Sorting __ex_table...
+Built 1 zonelists, mobility grouping off.  Total pages: 3070
+mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+SLUB: HWalign=16, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+NR_IRQS: 200
+Couldn't register vec255 interrupt
+clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+Console: colour dummy device 80x25
+printk: legacy console [hvc0] enabled
+printk: legacy console [hvc0] enabled
+printk: legacy bootconsole [sun3prom0] disabled
+printk: legacy bootconsole [sun3prom0] disabled
+Calibrating delay loop... 2000.48 BogoMIPS (lpj=10002432)
+pid_max: default: 32768 minimum: 301
+Mount-cache hash table entries: 2048 (order: 0, 8192 bytes, linear)
+Mountpoint-cache hash table entries: 2048 (order: 0, 8192 bytes, linear)
+VFS: Finished mounting rootfs on nullfs
+Memory: 19832K/24560K available (1952K kernel code, 305K rwdata, 1376K rodata, 112K init, 122K bss, 4064K reserved, 0K cma-reserved)
+devtmpfs: initialized
+posixtimers hash table entries: 512 (order: 0, 2048 bytes, linear)
+futex hash table entries: 256 (3072 bytes on 1 NUMA nodes, total 3 KiB, linear).
+pps_core: LinuxPPS API ver. 1 registered
+pps_core: Software ver. 5.3.6 - Copyright 2005-2007 Rodolfo Giometti <giometti@linux.it>
+Beginning ww (wound) mutex selftests
+Beginning ww (die) mutex selftests
+All ww mutex selftests passed
+workingset: timestamp_bits=30 (anon: 25) max_order=12 bucket_order=0 (anon: 0)
+Block layer SCSI generic (bsg) driver version 0.4 loaded (major 252)
+io scheduler mq-deadline registered
+io scheduler kyber registered
+io scheduler bfq registered
+dummy-irq: no IRQ given.  Use irq=N
+Rounding down aligned max_sectors from 4294967295 to 4294967280
+db_root: cannot open: /etc/target
+pps_ldisc: PPS line discipline registered
+This architecture does not have kernel memory protection.
+Run /init as init process
+===== Linux/sun3 userspace is up (PID 1 running from initramfs) =====
+Starting an interactive smolsh shell on /dev/console
+smolsh / > uname -a
+Linux (none) 7.3.0-rc4-sun3 #1 Mon Sep 28 02:04:19 UTC 2026 m68k nolibc/Linux
+smolsh / > 
