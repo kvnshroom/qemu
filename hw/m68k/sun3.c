@@ -40,6 +40,11 @@
  * error register and terminate in a bus error, which is how the PROM
  * sizes memory and probes for optional devices.
  *
+ * -bios runs the genuine boot PROM; -kernel (without -bios) loads a
+ * Linux/m68k sun3 ELF the way the monitor's boot program would and
+ * stands in for the PROM with a synthesised vector table (see
+ * sun3_build_prom() below).
+ *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
@@ -70,6 +75,9 @@
 #include "hw/scsi/ncr5380.h"
 #include "hw/scsi/scsi.h"
 #include "target/m68k/cpu.h"
+#include "elf.h"
+#include "standard-headers/asm-m68k/bootinfo.h"
+#include "bootinfo.h"
 
 /* --- Sun-3 MMU geometry --- */
 
@@ -258,6 +266,27 @@
 #define SUN3_EEPROM_CONS_TTYA   0x10
 #define SUN3_EEPROM_CONS_TTYB   0x11
 #define SUN3_RAM_MAX            (24 * MiB)
+#define SUN3_INVALID_PMEG       0xFF
+
+/*
+ * -kernel (Linux/m68k sun3, no PROM image): the kernel is linked at
+ * KERNBASE but loaded at physical 0 and entered at entry - KERNBASE
+ * through the boot loader's low identity map (arch/m68k/kernel/sun3-head.S,
+ * asm/sun3-head.h).  It finds the PROM vector table at VA 0x0FEF0000
+ * (asm/openprom.h LINUX_OPPROM_BEGVM), which on the real machine is the
+ * boot EPROM itself; the synthesised PROM below is a 64KB EPROM image
+ * whose first 0xE0 bytes are that table, exactly like the genuine ROM.
+ */
+#define SUN3_KERNBASE           0x0E000000
+#define SUN3_PROM_VA            0x0FEF0000
+#define SUN3_IO_VA              0x0FE00000  /* the PROM's device page segment */
+#define SUN3_PMEG_IO            254         /* config.c: "main I/O" */
+#define SUN3_PMEG_ROM           247         /* config.c: "ROM mapping" */
+#define SUN3_PROM_PTE_IO        (SUN3_PG_VALID | SUN3_PG_WRITE | \
+                                 SUN3_PG_SYSTEM | SUN3_PG_NC | \
+                                 (SUN3_TYPE_OBIO << SUN3_PG_TYPE_SHIFT))
+#define SUN3_PROM_PTE_RAM       (SUN3_PG_VALID | SUN3_PG_WRITE | \
+                                 SUN3_PG_SYSTEM)
 
 /* interrupt register bits (PROM writes 0x21 = enable-all + clock-5) */
 #define SUN3_IREG_ALL_ENAB      0x01
@@ -343,6 +372,7 @@ struct Sun3MachineState {
 
     uint32_t reset_sp;
     uint32_t reset_pc;
+    bool kernel_boot;           /* -kernel: synthesised PROM, maps preloaded */
     uint8_t idprom[SUN3_IDPROM_SIZE];
 
     /* MMU */
@@ -1552,6 +1582,307 @@ static const MemoryRegionOps sun3_bw2_id_ops = {
 
 /* --- machine --- */
 
+
+/* --- -kernel: the synthesised PROM and the boot loader's maps --- */
+
+/*
+ * The Linux/sun3 kernel is booted on real hardware by a boot program the
+ * PROM loaded: it runs with the MMU on, in context 0, through the low
+ * identity map the monitor leaves (sun3-head.S copies the segment maps
+ * from VA 0 up to the first invalid PMEG to KERNBASE and jumps high),
+ * and it keeps calling into the resident PROM for the rest of its life:
+ * config.c reads pv_sun3mem and pv_monid, hvc_sun3 and the early console
+ * use pv_nbputchar/pv_nbgetchar, mmu_emu_init() copies context 0's
+ * segment map into the other seven contexts through pv_setctxt, and
+ * halt/reboot call pv_halt/pv_reboot.
+ *
+ * Without -bios the machine therefore stands in for the monitor's
+ * power-on state: a 64KB EPROM image whose first 0xE0 bytes are the
+ * romvec (as in the genuine ROM, whose vector table starts at offset 0 =
+ * VA 0x0FEF0000) followed by hand-assembled stubs, and a segment/page map
+ * preloaded at reset with the three things the kernel relies on: RAM
+ * identity-mapped in PMEG n = physical segment n (the monitor maps 8MB,
+ * here all of RAM), the PROM's device pages in PMEG 254 at VA 0x0FE00000
+ * (the kernel addresses the clock at 0x0FE06000 and the interrupt
+ * register at 0x0FE0A000 directly) and the EPROM in PMEG 247 at
+ * 0x0FEF0000.  No RAM globals are needed: pv_sun3mem and pv_monid point
+ * into the EPROM image.  All of it is data the PROM would have left
+ * behind; the code path is the kernel's own, with the same entry (physical
+ * 0x2000, enable register NOTBOOT|SDVMA) the monitor's `g` command gives.
+ */
+enum {
+    RV_INITSP       = 0x00,
+    RV_STARTMON     = 0x04,
+    RV_MEMSIZE      = 0x10,     /* pv_sun3mem */
+    RV_GETCHAR      = 0x14,
+    RV_PUTCHAR      = 0x18,
+    RV_NBGETCHAR    = 0x1C,
+    RV_NBPUTCHAR    = 0x20,
+    RV_ECHO         = 0x24,
+    RV_INSOURCE     = 0x28,
+    RV_OUTSINK      = 0x2C,
+    RV_MONID        = 0x4C,
+    RV_REBOOT       = 0x60,
+    RV_ROMVERS      = 0xA4,
+    RV_MEMORYAVAIL  = 0xB8,
+    RV_HALT         = 0xC4,
+    RV_SETCTXT      = 0xCC,     /* pv_setctxt / setcxsegmap */
+    RV_SIZE         = 0xE0,
+};
+
+/* offsets of the stubs and data inside the synthesised EPROM image */
+enum {
+    PROM_PUTCHAR    = 0x0100,
+    PROM_GETCHAR    = 0x0140,
+    PROM_SETCTXT    = 0x0180,
+    PROM_HALT       = 0x0240,
+    PROM_MEMSIZE    = 0x0300,
+    PROM_CONS       = 0x0304,   /* echo, insource, outsink bytes */
+    PROM_MONID      = 0x0310,
+};
+
+/*
+ * pv_putchar/pv_nbputchar(int ch): ttya is zs0 channel A, whose PROM page
+ * is VA 0x0FE02000 (obio 0x20000): csr +4, data +6.  The ESCC transmits
+ * nothing until WR5.TXEN is set, so enable it every time (the monitor's
+ * zs init never ran), then wait for RR0.TXEMPTY (bit 2).  The genuine
+ * routine (ROM 0x0ECE) returns -1 instead of waiting; Linux's
+ * prom_putchar() retries either way.
+ */
+static const uint8_t sun3_prom_putchar[] = {
+    0x13, 0xfc, 0x00, 0x05, 0x0f, 0xe0, 0x20, 0x04, /* move.b #5,csr */
+    0x13, 0xfc, 0x00, 0x68, 0x0f, 0xe0, 0x20, 0x04, /* move.b #0x68,csr */
+    0x12, 0x39, 0x0f, 0xe0, 0x20, 0x04,             /* 1: move.b csr,d1 */
+    0x08, 0x01, 0x00, 0x02,                         /* btst #2,d1 */
+    0x67, 0xf4,                                     /* beq.s 1b */
+    0x12, 0x2f, 0x00, 0x07,                         /* move.b 7(sp),d1 */
+    0x13, 0xc1, 0x0f, 0xe0, 0x20, 0x06,             /* move.b d1,data */
+    0x70, 0x00,                                     /* moveq #0,d0 */
+    0x4e, 0x75,                                     /* rts */
+};
+
+/* pv_getchar/pv_nbgetchar(): the character, or -1 if none is waiting */
+static const uint8_t sun3_prom_getchar[] = {
+    0x13, 0xfc, 0x00, 0x03, 0x0f, 0xe0, 0x20, 0x04, /* move.b #3,csr */
+    0x13, 0xfc, 0x00, 0xc1, 0x0f, 0xe0, 0x20, 0x04, /* move.b #0xc1,csr */
+    0x12, 0x39, 0x0f, 0xe0, 0x20, 0x04,             /* move.b csr,d1 */
+    0x08, 0x01, 0x00, 0x00,                         /* btst #0,d1 */
+    0x66, 0x04,                                     /* bne.s 1f */
+    0x70, 0xff,                                     /* moveq #-1,d0 */
+    0x4e, 0x75,                                     /* rts */
+    0x10, 0x39, 0x0f, 0xe0, 0x20, 0x06,             /* 1: move.b data,d0 */
+    0x02, 0x80, 0x00, 0x00, 0x00, 0xff,             /* andi.l #0xff,d0 */
+    0x4e, 0x75,                                     /* rts */
+};
+
+/*
+ * pv_setctxt(int ctxt, char *va, int pmeg): write one segment map entry
+ * of another context.  Transcribed from the genuine setcxsegmap (ROM
+ * 0x0AC8): DFC = 3, then clear the enable register's NOTBOOT bit so that
+ * instruction fetches keep coming from the EPROM whatever the target
+ * context maps (the redirect decodes the low 16 address bits, which are
+ * the EPROM offset of this very routine), switch context, store the PMEG,
+ * switch back, restore the enable register and DFC.  Nothing touches the
+ * stack between the two context switches.
+ */
+static const uint8_t sun3_prom_setctxt[] = {
+    0x2f, 0x02,                                     /* move.l d2,-(sp) */
+    0x2f, 0x03,                                     /* move.l d3,-(sp) */
+    0x4e, 0x7a, 0x90, 0x01,                         /* movec dfc,a1 */
+    0x72, 0x03,                                     /* moveq #3,d1 */
+    0x4e, 0x7b, 0x10, 0x01,                         /* movec d1,dfc */
+    0x20, 0x6f, 0x00, 0x10,                         /* movea.l 16(sp),a0 */
+    0xd1, 0xfc, 0x20, 0x00, 0x00, 0x00,             /* adda.l #AC_SEGMAP,a0 */
+    0x20, 0x2f, 0x00, 0x14,                         /* move.l 20(sp),d0 */
+    0x12, 0x2f, 0x00, 0x0f,                         /* move.b 15(sp),d1 */
+    0x0e, 0x39, 0x20, 0x00, 0x40, 0x00, 0x00, 0x00, /* moves.b ENABLE,d2 */
+    0x36, 0x3c, 0xff, 0x7f,                         /* move.w #0xff7f,d3 */
+    0xc6, 0x02,                                     /* and.b d2,d3 */
+    0x0e, 0x39, 0x38, 0x00, 0x40, 0x00, 0x00, 0x00, /* moves.b d3,ENABLE */
+    0x0e, 0x39, 0x30, 0x00, 0x30, 0x00, 0x00, 0x00, /* moves.b CONTEXT,d3 */
+    0x0e, 0x39, 0x18, 0x00, 0x30, 0x00, 0x00, 0x00, /* moves.b d1,CONTEXT */
+    0x0e, 0x10, 0x08, 0x00,                         /* moves.b d0,(a0) */
+    0x0e, 0x39, 0x38, 0x00, 0x30, 0x00, 0x00, 0x00, /* moves.b d3,CONTEXT */
+    0x0e, 0x39, 0x28, 0x00, 0x40, 0x00, 0x00, 0x00, /* moves.b d2,ENABLE */
+    0x4e, 0x7b, 0x90, 0x01,                         /* movec a1,dfc */
+    0x26, 0x1f,                                     /* move.l (sp)+,d3 */
+    0x24, 0x1f,                                     /* move.l (sp)+,d2 */
+    0x4e, 0x75,                                     /* rts */
+};
+
+/* pv_halt / pv_reboot */
+static const uint8_t sun3_prom_halt[] = {
+    0x60, 0xfe,                                     /* bra.s . */
+};
+
+static void sun3_build_prom(Sun3MachineState *m, uint32_t ram_size)
+{
+    uint8_t *p = memory_region_get_ram_ptr(&m->rom);
+
+    memset(p, 0, SUN3_ROM_SIZE);
+
+    /* the vector table, VA 0x0FEF0000 + offset */
+    stl_be_p(p + RV_INITSP,      m->reset_sp);
+    stl_be_p(p + RV_STARTMON,    m->reset_pc);
+    stl_be_p(p + RV_MEMSIZE,     SUN3_PROM_VA + PROM_MEMSIZE);
+    stl_be_p(p + RV_GETCHAR,     SUN3_PROM_VA + PROM_GETCHAR);
+    stl_be_p(p + RV_PUTCHAR,     SUN3_PROM_VA + PROM_PUTCHAR);
+    stl_be_p(p + RV_NBGETCHAR,   SUN3_PROM_VA + PROM_GETCHAR);
+    stl_be_p(p + RV_NBPUTCHAR,   SUN3_PROM_VA + PROM_PUTCHAR);
+    stl_be_p(p + RV_ECHO,        SUN3_PROM_VA + PROM_CONS + 0);
+    stl_be_p(p + RV_INSOURCE,    SUN3_PROM_VA + PROM_CONS + 1);
+    stl_be_p(p + RV_OUTSINK,     SUN3_PROM_VA + PROM_CONS + 2);
+    stl_be_p(p + RV_MONID,       SUN3_PROM_VA + PROM_MONID);
+    stl_be_p(p + RV_REBOOT,      SUN3_PROM_VA + PROM_HALT);
+    stl_be_p(p + RV_ROMVERS,     2);
+    stl_be_p(p + RV_MEMORYAVAIL, SUN3_PROM_VA + PROM_MEMSIZE);
+    stl_be_p(p + RV_HALT,        SUN3_PROM_VA + PROM_HALT);
+    stl_be_p(p + RV_SETCTXT,     SUN3_PROM_VA + PROM_SETCTXT);
+
+    memcpy(p + PROM_PUTCHAR, sun3_prom_putchar, sizeof(sun3_prom_putchar));
+    memcpy(p + PROM_GETCHAR, sun3_prom_getchar, sizeof(sun3_prom_getchar));
+    memcpy(p + PROM_SETCTXT, sun3_prom_setctxt, sizeof(sun3_prom_setctxt));
+    memcpy(p + PROM_HALT,    sun3_prom_halt,    sizeof(sun3_prom_halt));
+
+    stl_be_p(p + PROM_MEMSIZE, ram_size);
+    p[PROM_CONS + 0] = 0;       /* echo off */
+    p[PROM_CONS + 1] = 1;       /* inSource: ttya */
+    p[PROM_CONS + 2] = 1;       /* outSink: ttya */
+    strcpy((char *)p + PROM_MONID, "QEMU");
+}
+
+/*
+ * The maps the boot loader leaves for sun3-head.S (context 0; the
+ * others are copied by the kernel through pv_setctxt): every segment
+ * invalid (0xFF, which is what stops head.S's copy loop) except RAM
+ * identity-mapped with PMEG n = physical segment n, the PROM's device
+ * pages (its map table at ROM 0xD350: VA 0x0FE00000 + 2 * obio page
+ * for the first seven on-board devices, si at 0x0FE12000) in PMEG 254
+ * and the EPROM in PMEG 247.
+ */
+static void sun3_kernel_boot_maps(Sun3MachineState *m, uint32_t ram_size)
+{
+    static const uint32_t io_pages[][2] = {
+        { 0x0FE00000, SUN3_OBIO_ZS_KBD_MS },
+        { 0x0FE02000, SUN3_OBIO_ZS_TTY },
+        { 0x0FE04000, SUN3_OBIO_EEPROM },
+        { 0x0FE06000, SUN3_OBIO_CLOCK },
+        { 0x0FE08000, SUN3_OBIO_MEMERR },
+        { 0x0FE0A000, SUN3_OBIO_INTREG },
+        { 0x0FE10000, SUN3_OBIO_LANCE },
+        { 0x0FE12000, SUN3_OBIO_SI },
+        { 0x0FE16000, SUN3_OBIO_MEMREG },
+    };
+    unsigned nseg = ram_size >> SUN3_SEG_BITS;
+    unsigned seg, i;
+
+    memset(m->segmap, SUN3_INVALID_PMEG, sizeof(m->segmap));
+    memset(m->pgmap, 0, sizeof(m->pgmap));
+
+    for (seg = 0; seg < nseg; seg++) {
+        m->segmap[0][seg] = seg;
+        for (i = 0; i < SUN3_PAGES_PER_SEG; i++) {
+            m->pgmap[seg * SUN3_PAGES_PER_SEG + i] =
+                SUN3_PROM_PTE_RAM | (seg * SUN3_PAGES_PER_SEG + i);
+        }
+    }
+
+    m->segmap[0][SUN3_IO_VA >> SUN3_SEG_BITS] = SUN3_PMEG_IO;
+    for (i = 0; i < ARRAY_SIZE(io_pages); i++) {
+        unsigned page = (io_pages[i][0] >> SUN3_PAGE_BITS) &
+                        (SUN3_PAGES_PER_SEG - 1);
+
+        m->pgmap[SUN3_PMEG_IO * SUN3_PAGES_PER_SEG + page] =
+            SUN3_PROM_PTE_IO | (io_pages[i][1] >> SUN3_PAGE_BITS);
+    }
+
+    m->segmap[0][SUN3_PROM_VA >> SUN3_SEG_BITS] = SUN3_PMEG_ROM;
+    for (i = 0; i < SUN3_ROM_SIZE / SUN3_PAGE_SIZE; i++) {
+        unsigned page = ((SUN3_PROM_VA >> SUN3_PAGE_BITS) + i) &
+                        (SUN3_PAGES_PER_SEG - 1);
+
+        m->pgmap[SUN3_PMEG_ROM * SUN3_PAGES_PER_SEG + page] =
+            SUN3_PROM_PTE_IO | ((SUN3_OBIO_EPROM >> SUN3_PAGE_BITS) + i);
+    }
+}
+
+static uint64_t sun3_kernel_translate(void *opaque, uint64_t addr)
+{
+    return addr - SUN3_KERNBASE;
+}
+
+/*
+ * Load the ELF like sun3-tools/boot-linux.py does: every PT_LOAD at
+ * p_vaddr - KERNBASE (load_elf zero-fills the BSS tail, which
+ * sun3-head.S never does), the bootinfo at _end, entry at
+ * e_entry - KERNBASE.  Only BI_MACHTYPE is consumed by the sun3 kernel:
+ * config_sun3() takes the memory size from pv_sun3mem and overwrites
+ * the BI_MEMCHUNK record; BI_COMMAND_LINE is replaced by
+ * CONFIG_BOOTPARAM_STRING when that is configured (sun3-linux.config sets
+ * "console=hvc0"); BI_RAMDISK is generic.
+ */
+static void sun3_load_kernel(Sun3MachineState *m, MachineState *machine)
+{
+    CPUState *cs = CPU(m->cpu);
+    uint64_t elf_entry, high;
+    ssize_t kernel_size;
+    hwaddr top = machine->ram_size - 2 * SUN3_PAGE_SIZE; /* PROM pages */
+    hwaddr bootinfo_base;
+    void *blob, *ptr;
+
+    kernel_size = load_elf(machine->kernel_filename, NULL,
+                           sun3_kernel_translate, NULL, &elf_entry, NULL,
+                           &high, NULL, ELFDATA2MSB, EM_68K, 0, 0);
+    if (kernel_size < 0) {
+        error_report("sun3-60: could not load kernel '%s'",
+                     machine->kernel_filename);
+        exit(1);
+    }
+    if (high > top) {
+        error_report("sun3-60: kernel '%s' does not fit in %u MiB of RAM",
+                     machine->kernel_filename,
+                     (unsigned)(machine->ram_size / MiB));
+        exit(1);
+    }
+    m->reset_pc = elf_entry - SUN3_KERNBASE;
+    m->reset_sp = m->reset_pc;      /* unused: head.S loads its own */
+
+    bootinfo_base = QEMU_ALIGN_UP(high, 4);
+    blob = g_malloc(1024 + (machine->kernel_cmdline ?
+                            strlen(machine->kernel_cmdline) : 0));
+    ptr = blob;
+    BOOTINFO1(ptr, BI_MACHTYPE, MACH_SUN3);
+    BOOTINFO1(ptr, BI_CPUTYPE, CPU_68020);
+    BOOTINFO1(ptr, BI_FPUTYPE, FPU_68881);
+    BOOTINFO1(ptr, BI_MMUTYPE, MMU_SUN3);
+    if (machine->kernel_cmdline) {
+        BOOTINFOSTR(ptr, BI_COMMAND_LINE, machine->kernel_cmdline);
+    }
+    if (machine->initrd_filename) {
+        int64_t initrd_size = get_image_size(machine->initrd_filename, NULL);
+        hwaddr initrd_base;
+
+        if (initrd_size < 0) {
+            error_report("sun3-60: could not load initial ram disk '%s'",
+                         machine->initrd_filename);
+            exit(1);
+        }
+        initrd_base = (top - initrd_size) & ~(hwaddr)SUN3_PAGE_MASK;
+        if (initrd_base < bootinfo_base + 1024) {
+            error_report("sun3-60: initial ram disk '%s' does not fit",
+                         machine->initrd_filename);
+            exit(1);
+        }
+        load_image_targphys(machine->initrd_filename, initrd_base,
+                            top - initrd_base, &error_fatal);
+        BOOTINFO2(ptr, BI_RAMDISK, initrd_base, initrd_size);
+    }
+    BOOTINFO0(ptr, BI_LAST);
+    rom_add_blob_fixed_as("bootinfo", blob, ptr - blob, bootinfo_base,
+                          cs->as);
+    g_free(blob);
+}
+
 static void sun3_machine_reset(void *opaque)
 {
     Sun3MachineState *m = opaque;
@@ -1576,6 +1907,11 @@ static void sun3_machine_reset(void *opaque)
         sun3_parity_overlay_update(m);
     }
     sun3_si_reset(m);
+    if (m->kernel_boot) {
+        /* the state the monitor's `g` command would hand the kernel */
+        sun3_kernel_boot_maps(m, MACHINE(m)->ram_size);
+        m->enable = SUN3_ENA_NOTBOOT | SUN3_ENA_SDVMA;
+    }
 
     cpu_reset(cs);
     /*
@@ -1628,17 +1964,28 @@ static void sun3_init(MachineState *machine)
     memory_region_add_subregion(sysmem,
                                 SUN3_TYPE_SPACE(SUN3_TYPE_OBIO) +
                                 SUN3_OBIO_EPROM, &m->rom);
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
-    if (!filename ||
-        load_image_size(filename, memory_region_get_ram_ptr(&m->rom),
-                        SUN3_ROM_SIZE) <= 0) {
-        error_report("sun3-60: cannot load boot PROM '%s'", bios_name);
+    if (machine->kernel_filename && machine->firmware) {
+        error_report("sun3-60: -kernel boots without the PROM; "
+                     "use either -kernel or -bios");
         exit(1);
     }
-    memcpy(rom_header, memory_region_get_ram_ptr(&m->rom),
-           sizeof(rom_header));
-    m->reset_sp = ldl_be_p(&rom_header[0]);
-    m->reset_pc = ldl_be_p(&rom_header[4]);
+    m->kernel_boot = machine->kernel_filename != NULL;
+    if (m->kernel_boot) {
+        sun3_load_kernel(m, machine);
+        sun3_build_prom(m, machine->ram_size);
+    } else {
+        filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+        if (!filename ||
+            load_image_size(filename, memory_region_get_ram_ptr(&m->rom),
+                            SUN3_ROM_SIZE) <= 0) {
+            error_report("sun3-60: cannot load boot PROM '%s'", bios_name);
+            exit(1);
+        }
+        memcpy(rom_header, memory_region_get_ram_ptr(&m->rom),
+               sizeof(rom_header));
+        m->reset_sp = ldl_be_p(&rom_header[0]);
+        m->reset_pc = ldl_be_p(&rom_header[4]);
+    }
     for (i = 0; i < ARRAY_SIZE(m->rom_obmem); i++) {
         memory_region_init_alias(&m->rom_obmem[i], NULL, "sun3.eprom-obmem",
                                  &m->rom, 0, SUN3_ROM_SIZE);
