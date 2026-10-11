@@ -10,8 +10,9 @@
  *
  * This is a register file with the status registers derived from the
  * board state (battery level and voltage, USB power present). Register
- * meanings follow the AXP221/AXP223 datasheets; reset values for the
- * control registers are not captured from hardware yet.
+ * meanings follow the AXP221/AXP223 datasheets. The IC type, the status
+ * register layout and the battery ADC scaling were checked against a real
+ * Mini Plus; the control register defaults below are not from hardware.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -22,7 +23,8 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 
-#define AXP22X_PWR_INPUT_STATUS 0x00    /* bit5 VBUS present, bit4 usable,
+#define AXP22X_PWR_INPUT_STATUS 0x00    /* bit7 ACIN present, bit6 usable,
+                                           bit5 VBUS present, bit4 usable,
                                            bit2 battery current direction */
 #define AXP22X_PWR_OP_MODE      0x01    /* bit6 charging, bit5 battery
                                            present */
@@ -35,7 +37,7 @@
 #define AXP22X_BATT_CHRG_I_L    0x7b
 #define AXP22X_FG_RES           0xb9    /* bit7 valid, bits6:0 percent */
 
-/* AXP221/AXP223 report 0x06 here (unverified on the Mini Plus) */
+/* Read back as 0x06 on a Mini Plus */
 #define AXP22X_IC_TYPE_VALUE    0x06
 #define AXP22X_CHARGE_MA        500
 
@@ -50,7 +52,11 @@ static uint8_t axp22x_read_reg(AXP22xState *s, uint8_t reg)
 
     switch (reg) {
     case AXP22X_PWR_INPUT_STATUS:
-        return (s->vbus ? 0x30 : 0) | (axp22x_charging(s) ? 0x04 : 0);
+        /*
+         * The Mini Plus wires USB-C power to ACIN: a real unit on a charger
+         * with a full battery reads 0xc4 here and 0x30 in PWR_OP_MODE.
+         */
+        return (s->vbus ? 0xc4 : 0) | (axp22x_charging(s) ? 0x04 : 0);
     case AXP22X_PWR_OP_MODE:
         return 0x20 | (axp22x_charging(s) ? 0x40 : 0);
     case AXP22X_IC_TYPE:
