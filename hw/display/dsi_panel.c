@@ -118,6 +118,17 @@ static void dsi_dcs_panel_receive(DsiPanel *panel, uint8_t data_type,
     uint8_t cmd = len ? payload[0] : 0;
 
     trace_dsi_dcs_panel_cmd(data_type, cmd, len);
+    if (trace_event_get_state_backends(TRACE_DSI_DCS_PANEL_PAYLOAD)) {
+        /* The whole packet, so a panel's init sequence can be recorded */
+        GString *str = g_string_new(NULL);
+        uint32_t i;
+
+        for (i = 0; i < len; i++) {
+            g_string_append_printf(str, "%s%02x", i ? " " : "", payload[i]);
+        }
+        trace_dsi_dcs_panel_payload(data_type, str->str);
+        g_string_free(str, true);
+    }
 
     switch (data_type) {
     case MIPI_DSI_DCS_SHORT_WRITE:

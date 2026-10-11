@@ -232,3 +232,4 @@ mstar_dsi_packet(const char *kind, uint8_t data_type, uint8_t cmd, uint32_t arg)
 
 # dsi_panel.c
 dsi_dcs_panel_cmd(uint8_t data_type, uint8_t cmd, uint32_t len) "dt=0x%02x cmd=0x%02x len=%u"
+dsi_dcs_panel_payload(uint8_t data_type, const char *bytes) "dt=0x%02x %s"
