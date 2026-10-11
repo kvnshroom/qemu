@@ -41,14 +41,22 @@ static uint64_t mstar_regbank_read(void *opaque, hwaddr addr, unsigned size)
 {
     MStarRegbankState *s = MSTAR_REGBANK(opaque);
     unsigned boff = addr & 3;
+    uint16_t reg = s->regs[addr / 4];
     uint64_t val;
+    unsigned i;
+
+    for (i = 0; i < s->num_read_set; i++) {
+        if (s->read_set[i].offset == (addr & ~3)) {
+            reg |= s->read_set[i].value;
+        }
+    }
 
     if (boff >= 2) {
         val = 0;                                /* padding half-word */
     } else if (size == 1) {
-        val = (s->regs[addr / 4] >> (boff * 8)) & 0xff;
+        val = (reg >> (boff * 8)) & 0xff;
     } else {
-        val = s->regs[addr / 4];                /* 16-bit register */
+        val = reg;                              /* 16-bit register */
     }
 
     if (trace_event_get_state_backends(TRACE_MSTAR_REGBANK_READ)) {

@@ -284,6 +284,16 @@ static const MStarRegDefault mstarv7_usb_utmi_defaults[] = {
     { 0x004, 0x9080 },              /* config */
     { 0x010, 0x04af },              /* clkctrl */
 };
+/*
+ * UTMI +0x78 bit 1 is the calibration-done flag: the vendor ehci-hcd
+ * (Titania3_series_start_ehc) sets bit 0 to start the PHY calibration and
+ * spins until bit 1 reads back set. Nothing models the calibration, so
+ * report it done; the driver only warns about the (zero) calibration value.
+ * Seen with the Miyoo Mini Plus firmware, which brings up USB1 for its Wi-Fi.
+ */
+static const MStarRegDefault mstarv7_usb_utmi_read_set[] = {
+    { 0x078, 0x0002 },
+};
 static const MStarRegDefault mstarv7_usb_usbc_defaults[] = {
     { 0x000, 0x0200 },              /* USBC reset control */
 };
@@ -467,6 +477,10 @@ static void mstarv7_soc_init(Object *obj)
         s->disp_cfg[i].num_defaults = mstarv7_disp_cfg_defaults[i].num;
         s->disp_cfg[i].base = mstarv7_disp_cfg_base[i];
         s->disp_cfg[i].bankname = "disp_cfg";
+        if (mstarv7_disp_cfg_defaults[i].defaults == mstarv7_usb_utmi_defaults) {
+            s->disp_cfg[i].read_set = mstarv7_usb_utmi_read_set;
+            s->disp_cfg[i].num_read_set = ARRAY_SIZE(mstarv7_usb_utmi_read_set);
+        }
     }
     object_initialize_child(obj, "cpupll", &s->cpupll, TYPE_MSTAR_CPUPLL);
     object_initialize_child(obj, "pwm", &s->pwm, TYPE_MSTAR_PWM);

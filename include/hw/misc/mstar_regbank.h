@@ -50,6 +50,14 @@ struct MStarRegbankState {
     unsigned num_defaults;
 
     /*
+     * Optional status bits that always read back as set (OR-ed into the
+     * stored value), for hardware "done" flags the vendor code polls, e.g.
+     * the USB UTMI PHY calibration-done bit. Set before realize.
+     */
+    const MStarRegDefault *read_set;
+    unsigned num_read_set;
+
+    /*
      * Tracing support, set by the instantiator before realize. `base` is the
      * bank's absolute RIU address and `bankname` a short label, both used in
      * the trace output; `regnames` optionally names the registers we have
