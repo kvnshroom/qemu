@@ -15,7 +15,12 @@
  * at the address the address byte NAKs, exactly like a real bus with
  * the device absent.
  *
- * The completion interrupt is tracked but not wired up anywhere yet.
+ * The mainline msc313e-i2c driver does the same steps with 16-bit
+ * writes (STOP as bit 8 of 0x04, read trigger as bit 8 of 0x0c) and
+ * sleeps on the completion interrupt instead of polling. It reads the
+ * event that completed the step from INT_STAT bits 13:8 and clears it
+ * through INT_CTL. The interrupt is raised while a step is complete and
+ * CTRL.enint is set.
  *
  * Copyright (c) 2026 Daniel Palmer <daniel@thingy.jp>
  *
@@ -28,17 +33,47 @@
 #include "hw/i2c/mstar_i2c.h"
 
 /* Byte offsets; 16-bit registers with commands in single byte lanes */
+#define I2C_CTRL            0x00    /* bit 0 reset, bit 2 interrupt enable */
+#define I2C_CTRL_RST        (1 << 0)
+#define I2C_CTRL_ENINT      (1 << 2)
 #define I2C_CMD_START       0x04    /* byte: bit 0 generates START */
 #define I2C_CMD_STOP        0x05    /* byte: bit 0 generates STOP */
 #define I2C_CMD_BIT         (1 << 0)
 #define I2C_STOP_HIBIT      (1 << 8) /* STOP via a wide write to 0x04 */
 #define I2C_WDATA           0x08    /* W: byte to send; R: bit 8 = NAK */
 #define I2C_WDATA_NAK       (1 << 8)
-#define I2C_RDATA           0x0c    /* R: last received byte */
+#define I2C_RDATA           0x0c    /* R: last received byte;
+                                       W: bit 8 trigger read, bit 9 ACK */
+#define I2C_RDATA_TRIG      (1 << 8)
 #define I2C_RDATA_CFG       0x0d    /* byte: bit 0 trigger read, bit 1 ACK */
 #define I2C_RDATA_CFG_TRIG  (1 << 0)
 #define I2C_INT_CTL         0x10    /* R: bit 0 step complete; W: clear */
-#define I2C_CUR_STATE       0x14    /* R: state machine, 0 = idle */
+#define I2C_CUR_STATE       0x14    /* R: bits 4:0 state machine (0 =
+                                       idle), bits 13:8 completed events */
+#define I2C_EV_START_DET    (1 << 8)
+#define I2C_EV_STOP_DET     (1 << 9)
+#define I2C_EV_RX_DONE      (1 << 10)
+#define I2C_EV_TX_DONE      (1 << 11)
+
+static void mstar_i2c_update_irq(MStarI2cState *s)
+{
+    qemu_set_irq(s->irq, s->int_pending &&
+                 (s->regs[I2C_CTRL / 4] & I2C_CTRL_ENINT));
+}
+
+/* A command step has finished with the given event */
+static void mstar_i2c_step_done(MStarI2cState *s, uint16_t event)
+{
+    s->int_pending = true;
+    s->int_stat |= event;
+    mstar_i2c_update_irq(s);
+}
+
+static void mstar_i2c_recv(MStarI2cState *s)
+{
+    s->rdata = s->active ? i2c_recv(s->bus) : 0xff;
+    mstar_i2c_step_done(s, I2C_EV_RX_DONE);
+}
 
 static void mstar_i2c_end(MStarI2cState *s)
 {
@@ -59,7 +94,7 @@ static void mstar_i2c_wdata(MStarI2cState *s, uint8_t byte)
     } else {
         s->nak = true;
     }
-    s->int_pending = true;
+    mstar_i2c_step_done(s, I2C_EV_TX_DONE);
 }
 
 static uint64_t mstar_i2c_read(void *opaque, hwaddr addr, unsigned size)
@@ -74,7 +109,7 @@ static uint64_t mstar_i2c_read(void *opaque, hwaddr addr, unsigned size)
     case I2C_INT_CTL:
         return s->int_pending ? 1 : 0;
     case I2C_CUR_STATE:
-        return 0;   /* idle */
+        return s->int_stat;     /* state machine always idle */
     default:
         return s->regs[addr / 4];
     }
@@ -86,36 +121,53 @@ static void mstar_i2c_write(void *opaque, hwaddr addr, uint64_t val,
     MStarI2cState *s = MSTAR_I2C(opaque);
 
     switch (addr) {
+    case I2C_CTRL:
+        s->regs[I2C_CTRL / 4] = val;
+        if (val & I2C_CTRL_RST) {
+            /* The mainline driver resets before every repeated start */
+            mstar_i2c_end(s);
+            s->start_pending = false;
+            s->int_pending = false;
+            s->int_stat = 0;
+        }
+        mstar_i2c_update_irq(s);
+        return;
     case I2C_CMD_START:
         if (val & I2C_CMD_BIT) {
             /* A START while active is a repeated start */
             mstar_i2c_end(s);
             s->start_pending = true;
-            s->int_pending = true;
+            mstar_i2c_step_done(s, I2C_EV_START_DET);
         }
         if ((size > 1) && (val & I2C_STOP_HIBIT)) {
             mstar_i2c_end(s);
-            s->int_pending = true;
+            mstar_i2c_step_done(s, I2C_EV_STOP_DET);
         }
         return;
     case I2C_CMD_STOP:
         if (val & I2C_CMD_BIT) {
             mstar_i2c_end(s);
-            s->int_pending = true;
+            mstar_i2c_step_done(s, I2C_EV_STOP_DET);
         }
         return;
     case I2C_WDATA:
         mstar_i2c_wdata(s, val);
         return;
+    case I2C_RDATA:
+        if ((size > 1) && (val & I2C_RDATA_TRIG)) {
+            mstar_i2c_recv(s);
+        }
+        return;
     case I2C_RDATA_CFG:
         if (val & I2C_RDATA_CFG_TRIG) {
-            s->rdata = s->active ? i2c_recv(s->bus) : 0xff;
-            s->int_pending = true;
+            mstar_i2c_recv(s);
         }
         return;
     case I2C_INT_CTL:
         if (val & 1) {
             s->int_pending = false;
+            s->int_stat = 0;
+            mstar_i2c_update_irq(s);
         }
         return;
     default:
@@ -141,7 +193,9 @@ static void mstar_i2c_reset(DeviceState *dev)
     s->active = false;
     s->nak = false;
     s->int_pending = false;
+    s->int_stat = 0;
     s->rdata = 0;
+    qemu_set_irq(s->irq, 0);
 }
 
 static void mstar_i2c_init(Object *obj)

@@ -645,6 +645,9 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
             return;
         }
         sysbus_mmio_map(sbd, 0, MSTARV7_I2C_BASE + i * MSTARV7_I2C_STRIDE);
+        sysbus_connect_irq(sbd, 0,
+                           qdev_get_gpio_in(DEVICE(&s->intc_irq),
+                                            MSTARV7_I2C_INTC_IRQ + i));
     }
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->clkgen), errp)) {

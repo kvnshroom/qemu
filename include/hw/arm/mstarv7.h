@@ -135,6 +135,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_NUM_I2C         2
 #define MSTARV7_I2C_BASE        (MSTARV7_RIU_BASE + 0x223000)
 #define MSTARV7_I2C_STRIDE      0x200
+/* Their lines on the "IRQ" mst-intc (36 and 37, as in the mainline DT) */
+#define MSTARV7_I2C_INTC_IRQ    36
 /* The SAR ADC; boards hang keypads off its input channels */
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
 /* The analog CPU PLL; the Cortex-A7 clock (and cpufreq) derive from it */

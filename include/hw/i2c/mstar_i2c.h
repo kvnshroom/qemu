@@ -33,6 +33,7 @@ struct MStarI2cState {
     bool active;            /* a transfer is open on the bus */
     bool nak;               /* last address/data byte was not acked */
     bool int_pending;
+    uint16_t int_stat;      /* INT_STAT event bits 13:8 since last clear */
     uint8_t rdata;
 };
 
