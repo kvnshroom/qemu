@@ -33,7 +33,7 @@
 #define AXP22X_IRQ_STATUS_LAST  0x4c
 #define AXP22X_BATT_V_H         0x78    /* 12-bit battery voltage, 1.1 mV */
 #define AXP22X_BATT_V_L         0x79
-#define AXP22X_BATT_CHRG_I_H    0x7a    /* 12-bit charge current, 0.5 mA */
+#define AXP22X_BATT_CHRG_I_H    0x7a    /* 12-bit charge current, 1 mA */
 #define AXP22X_BATT_CHRG_I_L    0x7b
 #define AXP22X_FG_RES           0xb9    /* bit7 valid, bits6:0 percent */
 
@@ -67,7 +67,7 @@ static uint8_t axp22x_read_reg(AXP22xState *s, uint8_t reg)
         return reg == AXP22X_BATT_V_H ? adc >> 4 : adc & 0xf;
     case AXP22X_BATT_CHRG_I_H:
     case AXP22X_BATT_CHRG_I_L:
-        adc = axp22x_charging(s) ? AXP22X_CHARGE_MA * 2 : 0;
+        adc = axp22x_charging(s) ? AXP22X_CHARGE_MA : 0;
         return reg == AXP22X_BATT_CHRG_I_H ? adc >> 4 : adc & 0xf;
     case AXP22X_FG_RES:
         return 0x80 | MIN(s->battery_percent, 100);
