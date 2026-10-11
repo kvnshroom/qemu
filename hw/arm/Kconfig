@@ -117,6 +117,7 @@ config MSTARV7
     select MSTAR_PWM
     select MSTAR_WDT
     select MSTAR_REGBANK
+    select MSTAR_RNG
     select MSTAR_SAR
     select MSTAR_BDMA
     select MSTAR_FSP

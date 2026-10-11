@@ -446,6 +446,7 @@ static void mstarv7_soc_init(Object *obj)
     object_initialize_child(obj, "bdma", &s->bdma, TYPE_MSTAR_BDMA);
     object_initialize_child(obj, "fsp", &s->fsp, TYPE_MSTAR_FSP);
     object_initialize_child(obj, "sar", &s->sar, TYPE_MSTAR_SAR);
+    object_initialize_child(obj, "rng", &s->rng, TYPE_MSTAR_RNG);
 
     for (i = 0; i < MSTARV7_NUM_I2C; i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_MSTAR_I2C);
@@ -637,6 +638,11 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->sar), 0, MSTARV7_SAR_BASE);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rng), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->rng), 0, MSTARV7_RNG_BASE);
 
     for (i = 0; i < MSTARV7_NUM_I2C; i++) {
         SysBusDevice *sbd = SYS_BUS_DEVICE(&s->i2c[i]);

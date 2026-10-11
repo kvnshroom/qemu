@@ -12,6 +12,7 @@
 #include "qemu/units.h"
 #include "system/memory.h"
 #include "hw/adc/mstar_sar.h"
+#include "hw/misc/mstar_rng.h"
 #include "hw/audio/mstar_bach.h"
 #include "hw/cpu/a15mpcore.h"
 #include "hw/display/mstar_disp.h"
@@ -139,6 +140,8 @@ OBJECT_DECLARE_TYPE(MStarV7SoCState, MStarV7SoCClass, MSTARV7_SOC)
 #define MSTARV7_I2C_INTC_IRQ    36
 /* The SAR ADC; boards hang keypads off its input channels */
 #define MSTARV7_SAR_BASE        (MSTARV7_RIU_BASE + 0x2800)
+/* The random number generator (rng@224400) */
+#define MSTARV7_RNG_BASE        (MSTARV7_RIU_BASE + 0x224400)
 /* The analog CPU PLL; the Cortex-A7 clock (and cpufreq) derive from it */
 #define MSTARV7_CPUPLL_BASE     (MSTARV7_RIU_BASE + 0x206400)
 /* The PWM controller; on the Miyoo Mini one channel is the LCD backlight */
@@ -297,6 +300,7 @@ struct MStarV7SoCState {
     MStarBdmaState bdma;
     MStarFspState fsp;
     MStarSarState sar;
+    MStarRngState rng;
     MStarI2cState i2c[MSTARV7_NUM_I2C];
     MStarRegbankState clkgen;
     MStarRegbankState pm_clkgen;
