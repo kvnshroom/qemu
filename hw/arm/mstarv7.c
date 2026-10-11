@@ -122,9 +122,13 @@ static void mstarv7_smpctrl_write(void *opaque, hwaddr addr, uint64_t val,
         /*
          * Real hardware releases CPU1 from the mask ROM in Secure
          * state; enter at the highest exception level we have so the
-         * Secure-only setup the kernel does on it works.
+         * Secure-only setup the kernel does on it works. A directly
+         * loaded kernel starts CPU0 in Non-secure Hyp instead, and the
+         * kernel hangs once it runs work on a CPU1 in another mode, so
+         * the board can ask for CPU1 to start like CPU0.
          */
-        uint32_t el = arm_feature(&s->cpus[1].env, ARM_FEATURE_EL3) ? 3 : 1;
+        uint32_t el = s->secondary_el ? s->secondary_el :
+                      arm_feature(&s->cpus[1].env, ARM_FEATURE_EL3) ? 3 : 1;
         int ret = arm_set_cpu_on(s->cpus[1].mp_affinity, entry, 0, el, false);
 
         if (ret != QEMU_ARM_POWERCTL_RET_SUCCESS) {
@@ -796,6 +800,7 @@ static void mstarv7_soc_realize(DeviceState *dev, Error **errp)
 static const Property mstarv7_soc_properties[] = {
     DEFINE_PROP_UINT16("did-key", MStarV7SoCState, did_key,
                        MSTARV7_BOOT_MEDIA_SPI_NOR),
+    DEFINE_PROP_UINT8("secondary-el", MStarV7SoCState, secondary_el, 0),
 };
 
 static void mstarv7_soc_class_init(ObjectClass *oc, const void *data)

@@ -238,6 +238,15 @@ static void miyoomini_init(MachineState *machine)
     object_property_set_uint(OBJECT(&MSTARV7_SOC(&s->soc)->sar), "channel0",
                              MIYOOMINI_BATTERY_SAR_CH0, &error_fatal);
 
+    /*
+     * A -kernel boot puts CPU0 in Non-secure Hyp (the Cortex-A7 has
+     * EL2); start CPU1 there too when the kernel brings it up.
+     */
+    if (machine->kernel_filename) {
+        object_property_set_uint(OBJECT(&s->soc), "secondary-el", 2,
+                                 &error_fatal);
+    }
+
     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
 
     /*

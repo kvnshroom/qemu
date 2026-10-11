@@ -324,6 +324,7 @@ struct MStarV7SoCState {
 
     /* DID_KEY value, i.e. the boot-media strap ("did-key" property) */
     uint16_t did_key;
+    uint8_t secondary_el;   /* EL CPU1 starts in; 0: as on hardware */
 };
 
 struct MStarV7SoCClass {
