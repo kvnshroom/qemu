@@ -135,6 +135,7 @@ config MIYOOMINI
     default y
     depends on TCG && ARM
     select ALPU
+    select AXP22X
     select INFINITY2M
 
 config MUSICPAL

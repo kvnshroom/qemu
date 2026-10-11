@@ -267,3 +267,7 @@ config MSTAR_PWM
 
 config MSTAR_REGBANK
     bool
+
+config AXP22X
+    bool
+    depends on I2C

@@ -24,12 +24,14 @@
 #include "hw/arm/ssd202d.h"
 #include "hw/display/dsi.h"
 #include "hw/i2c/alpu.h"
+#include "hw/misc/axp22x.h"
 #include "hw/core/irq.h"
 #include "hw/sd/sd.h"
 #include "ui/input.h"
 #include "standard-headers/linux/input-event-codes.h"
 
 #define TYPE_MIYOOMINI_MACHINE MACHINE_TYPE_NAME("miyoomini")
+#define TYPE_MIYOOMINIPLUS_MACHINE MACHINE_TYPE_NAME("miyoomini-plus")
 OBJECT_DECLARE_SIMPLE_TYPE(MiyooMiniMachineState, MIYOOMINI_MACHINE)
 
 /*
@@ -343,12 +345,42 @@ static void miyoomini_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_cdrom = 1;
 }
 
+/*
+ * Miyoo Mini Plus: same SoC, ALPU and boot flow as the Mini, plus an
+ * X-Powers AXP223 PMIC on i2c bus 1 at 0x34 that the vendor axp_test
+ * tool drives from userspace. The Plus panel, button pads and Wi-Fi are
+ * not modelled separately yet.
+ */
+static void miyoominiplus_init(MachineState *machine)
+{
+    MiyooMiniMachineState *s = MIYOOMINI_MACHINE(machine);
+
+    miyoomini_init(machine);
+    i2c_slave_create_simple(MSTARV7_SOC(&s->soc)->i2c[1].bus, TYPE_AXP22X,
+                            0x34);
+}
+
+static void miyoominiplus_machine_class_init(ObjectClass *oc,
+                                             const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Miyoo Mini Plus (SigmaStar SSD202D, AXP223)";
+    mc->init = miyoominiplus_init;
+}
+
 static const TypeInfo miyoomini_machine_types[] = {
     {
         .name           = TYPE_MIYOOMINI_MACHINE,
         .parent         = TYPE_MACHINE,
         .instance_size  = sizeof(MiyooMiniMachineState),
         .class_init     = miyoomini_machine_class_init,
+        .interfaces     = arm_machine_interfaces,
+    },
+    {
+        .name           = TYPE_MIYOOMINIPLUS_MACHINE,
+        .parent         = TYPE_MIYOOMINI_MACHINE,
+        .class_init     = miyoominiplus_machine_class_init,
         .interfaces     = arm_machine_interfaces,
     },
     {
